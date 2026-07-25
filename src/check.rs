@@ -3,6 +3,23 @@
 //! and touches no daemon state. Delivery is not turnpike's job: callers inspect
 //! the exit code from a coding-agent hook, shell prompt, or notifier wrapper, so
 //! turnpike stays a meter, not a notifier.
+//!
+//! The exit code has four values, not three, because "I can't tell you the
+//! answer" and "something is broken" are different signals that call for
+//! different caller behavior:
+//!
+//! - `0` under, `1` at/over — the two answers, from known-priced spend.
+//! - `2` error — the caller did something wrong (bad `--budget`), or the data
+//!   itself is corrupt. Fix the invocation or go investigate.
+//! - `3` unknown — nothing is broken, turnpike just can't vouch for the
+//!   number right now: no calls recorded yet (fresh install, or the proxy
+//!   isn't running), or some calls in the window have no price. This is
+//!   routine and often self-resolving (`turnpike prices pull`, or wait for
+//!   data), so a caller shouldn't treat it with the same severity as `2`.
+//!
+//! Known spend at or over the ceiling is always decisive and reported as `1`
+//! even when other calls are unpriced — missing data can't make an
+//! already-exceeded budget un-exceeded.
 
 use crate::cost::{call_cost, usage_from_counts};
 use crate::paths::{calls_db, prices_json};
@@ -62,41 +79,63 @@ impl Verdict {
     }
 }
 
-/// Returns `true` when spend in the window is at or over budget — the caller
-/// maps that to process exit code 1.
-pub fn run(opts: CheckOpts) -> Result<bool> {
+/// What `turnpike check` answered — see the module doc for the exit-code
+/// mapping and why `Unknown` is not folded into the `Err` path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    Under,
+    Over,
+    Unknown,
+}
+
+/// Decide the outcome from the verdict math plus what data was available.
+/// Pulled out of [`run`] so the priority rule — over beats missing data,
+/// missing data beats under — is unit-testable without a database.
+fn classify(v: &Verdict, has_data: bool, unpriced: i64) -> Outcome {
+    if v.over {
+        Outcome::Over
+    } else if !has_data || unpriced > 0 {
+        Outcome::Unknown
+    } else {
+        Outcome::Under
+    }
+}
+
+pub fn run(opts: CheckOpts) -> Result<Outcome> {
     let lower = window_bound(&opts.period)?;
 
     let path = calls_db();
-    if !path.exists() {
-        bail!(
-            "call database not found at {}; cannot determine spend",
-            path.display()
-        );
-    }
-    let conn = open_db(&path)?;
-    let prices = PriceTable::load(&prices_json());
-    let (spent, unpriced) = sum_spend(&conn, &prices, &lower)?;
+    let has_data = path.exists();
+    let (spent, unpriced) = if has_data {
+        let conn = open_db(&path)?;
+        let prices = PriceTable::load(&prices_json());
+        sum_spend(&conn, &prices, &lower)?
+    } else {
+        (0.0, 0)
+    };
 
     let v = Verdict::new(spent, opts.budget);
-
-    // Known spend over the ceiling is decisive even if other calls are
-    // unpriced. Below the ceiling, unpriced calls make the answer unknowable;
-    // surface that as an error instead of returning a false "under" verdict.
-    if !v.over && unpriced > 0 {
-        bail!(
-            "{unpriced} calls with tokens have no price; cannot determine whether spend is under budget; run `turnpike prices pull`"
-        );
-    }
+    let outcome = classify(&v, has_data, unpriced);
 
     if opts.json {
+        let status = match outcome {
+            Outcome::Under => "under",
+            Outcome::Over => "over",
+            Outcome::Unknown => "unknown",
+        };
+        let reason = match (outcome, has_data) {
+            (Outcome::Unknown, false) => Some("no_data"),
+            (Outcome::Unknown, true) => Some("unpriced_calls"),
+            _ => None,
+        };
         let out = serde_json::json!({
             "window": opts.period,
             "since": lower,
+            "status": status,
+            "reason": reason,
             "spent": spent,
             "budget": opts.budget,
             "pct": v.pct,
-            "over": v.over,
             "remaining": v.remaining,
             "unpriced_calls": unpriced,
         });
@@ -105,10 +144,10 @@ pub fn run(opts: CheckOpts) -> Result<bool> {
             serde_json::to_string(&out).expect("serializing known-valid JSON")
         );
     } else if !opts.quiet {
-        let label = if v.over {
-            format!("OVER by ${:.2}", -v.remaining)
-        } else {
-            "ok".to_string()
+        let label = match outcome {
+            Outcome::Over => format!("OVER by ${:.2}", -v.remaining),
+            Outcome::Under => "ok".to_string(),
+            Outcome::Unknown => "unknown".to_string(),
         };
         println!(
             "{}: ${:.2} / ${:.2} ({:.0}%) — {}",
@@ -116,17 +155,19 @@ pub fn run(opts: CheckOpts) -> Result<bool> {
         );
     }
 
-    // Reaching here with unpriced calls means known spend already proves the
-    // budget is exceeded. Preserve that verdict, but disclose that the total is
-    // only a lower bound.
-    if unpriced > 0 {
+    // The stdout label says *that* the answer is unknown; stderr says *why*,
+    // regardless of --quiet, since this is the part a caller (or the human
+    // debugging one) needs to act on.
+    if !has_data {
+        eprintln!("warning: no calls recorded yet; cannot determine spend — is turnpike running?");
+    } else if unpriced > 0 {
         eprintln!(
             "warning: {unpriced} calls with tokens had no price and count as $0 — \
              real spend may be higher; run `turnpike prices pull`"
         );
     }
 
-    Ok(v.over)
+    Ok(outcome)
 }
 
 /// Total USD spent since `lower`, and the count of token-bearing calls that had
@@ -240,6 +281,30 @@ mod tests {
         let over = Verdict::new(60.0, 50.0);
         assert!((over.remaining + 10.0).abs() < 1e-9, "{}", over.remaining);
         assert!((over.pct - 120.0).abs() < 1e-9, "{}", over.pct);
+    }
+
+    #[test]
+    fn classify_prefers_over_even_without_full_information() {
+        // An already-exceeded budget stays exceeded no matter what data is
+        // missing — that's the whole point of checking `over` first.
+        let v = Verdict::new(60.0, 50.0);
+        assert_eq!(classify(&v, true, 3), Outcome::Over);
+        assert_eq!(classify(&v, false, 0), Outcome::Over);
+    }
+
+    #[test]
+    fn classify_is_unknown_without_data_or_with_unpriced_calls() {
+        let no_data = Verdict::new(0.0, 50.0);
+        assert_eq!(classify(&no_data, false, 0), Outcome::Unknown);
+
+        let has_unpriced = Verdict::new(10.0, 50.0);
+        assert_eq!(classify(&has_unpriced, true, 2), Outcome::Unknown);
+    }
+
+    #[test]
+    fn classify_is_under_only_with_complete_priced_data() {
+        let v = Verdict::new(10.0, 50.0);
+        assert_eq!(classify(&v, true, 0), Outcome::Under);
     }
 
     #[test]

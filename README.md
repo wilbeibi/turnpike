@@ -117,7 +117,9 @@ Add `--json` to `stats` or `tail` for machine-readable output.
 
 Pick a number you don't want to cross, and ask. `turnpike check` prints a one-line
 answer, and — the actually useful part — sets its exit code: `0` under, `1` at or
-over, `2` if something went wrong:
+over, `2` on error (bad `--budget`, corrupt data — fix the invocation or go
+investigate), `3` unknown (nothing's broken, turnpike just can't vouch for the
+number yet — no calls recorded, or some have no price):
 
 ```zsh
 turnpike check --budget 50/day
@@ -133,14 +135,15 @@ window (`300/7d`, `20/24h`). turnpike won't send the alert for you — it's a me
 not a notifier — so hook it up to whatever already yells at you:
 
 ```zsh
-# quiet, exit-code only: notify on 1; preserve errors such as 2
+# quiet, exit-code only: four outcomes, not two
 turnpike check --budget 50/day -q
-check_status=$?
-if (( check_status == 1 )); then
-  ntfy send "LLM budget blown"
-elif (( check_status != 0 )); then
-  exit $check_status
-fi
+status=$?
+case $status in
+  0) ;;                              # under budget
+  1) ntfy send "LLM budget blown" ;; # at/over — the actionable alert
+  3) ;;                              # unknown — no data yet, or a price gap; not an error
+  *) exit $status ;;                 # 2: something's actually broken — propagate, don't swallow
+esac
 
 # a shell prompt segment, a cron/timer line, or a coding-agent hook can all
 # just run `turnpike check` and branch on the exit code

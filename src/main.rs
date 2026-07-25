@@ -47,9 +47,11 @@ async fn main() -> anyhow::Result<()> {
             json,
         } => {
             // Distinct exit codes are the whole contract: 0 = under budget,
-            // 1 = at/over budget (the branchable signal), 2 = error. Callers
-            // must inspect the exact status rather than treating every nonzero
-            // status as an over-budget verdict.
+            // 1 = at/over budget (the branchable signal), 2 = error (bad
+            // input, corrupt data), 3 = unknown (nothing broken, just can't
+            // vouch for the number). Callers must inspect the exact status
+            // rather than treating every nonzero status as over-budget, and
+            // must not treat 3 with the same severity as 2 — see check.rs.
             let verdict = check::parse_budget(&budget).and_then(|(budget, period)| {
                 check::run(check::CheckOpts {
                     budget,
@@ -59,8 +61,9 @@ async fn main() -> anyhow::Result<()> {
                 })
             });
             match verdict {
-                Ok(true) => std::process::exit(1),
-                Ok(false) => {}
+                Ok(check::Outcome::Under) => {}
+                Ok(check::Outcome::Over) => std::process::exit(1),
+                Ok(check::Outcome::Unknown) => std::process::exit(3),
                 Err(e) => {
                     eprintln!("turnpike: {e:#}");
                     std::process::exit(2);

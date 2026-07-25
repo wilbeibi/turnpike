@@ -52,6 +52,14 @@ fn run_check(data: &TestDataDir, budget: &str) -> Output {
         .unwrap()
 }
 
+fn run_check_json(data: &TestDataDir, budget: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_turnpike"))
+        .args(["check", "--budget", budget, "--json"])
+        .env("XDG_DATA_HOME", &data.0)
+        .output()
+        .unwrap()
+}
+
 fn data_with_cost(cost: f64) -> TestDataDir {
     let data = TestDataDir::new();
     let conn = create_db(&data.db_path());
@@ -88,7 +96,7 @@ fn known_spend_over_budget_exits_one() {
 }
 
 #[test]
-fn unpriced_spend_below_budget_exits_two() {
+fn unpriced_spend_below_budget_exits_three_unknown() {
     let data = TestDataDir::new();
     let conn = create_db(&data.db_path());
     conn.execute_batch(
@@ -98,8 +106,25 @@ fn unpriced_spend_below_budget_exits_two() {
     .unwrap();
     let output = run_check(&data, "3/2020-01-01");
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot determine"));
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("real spend may be higher"));
+}
+
+#[test]
+fn unpriced_spend_reports_unknown_status_and_reason_in_json() {
+    let data = TestDataDir::new();
+    let conn = create_db(&data.db_path());
+    conn.execute_batch(
+        "INSERT INTO calls VALUES
+            ('2026-07-20T10:00:00Z', 'unknown-model', 100, 50, 0, 0, NULL);",
+    )
+    .unwrap();
+    let output = run_check_json(&data, "3/2020-01-01");
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""status":"unknown"#));
+    assert!(stdout.contains(r#""reason":"unpriced_calls"#));
 }
 
 #[test]
@@ -132,12 +157,23 @@ fn malformed_database_row_exits_two() {
 }
 
 #[test]
-fn missing_database_exits_two() {
+fn missing_database_exits_three_unknown() {
     let data = TestDataDir::new();
     let output = run_check(&data, "3/2020-01-01");
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("database not found"));
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is turnpike running"));
+}
+
+#[test]
+fn missing_database_reports_unknown_status_and_reason_in_json() {
+    let data = TestDataDir::new();
+    let output = run_check_json(&data, "50/2020-01-01");
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""status":"unknown"#));
+    assert!(stdout.contains(r#""reason":"no_data"#));
 }
 
 #[test]

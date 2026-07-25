@@ -56,10 +56,12 @@ pub enum Command {
         json: bool,
     },
 
-    /// Check spend in a window against a budget. Exit 0 under, 1 at/over, 2 on error.
+    /// Check spend in a window against a budget. Exit 0 under, 1 at/over,
+    /// 2 error, 3 unknown (can't determine spend — see stderr).
     ///
     /// Delivery is left to your shell, coding-agent hook, or prompt segment;
-    /// inspect the exact status so errors are not mistaken for over-budget.
+    /// inspect the exact status — error and unknown are different signals
+    /// from over-budget, and from each other.
     Check {
         /// Budget as AMOUNT or AMOUNT/PERIOD: 50, 50/day, 300/7d, 500/month.
         /// PERIOD is day|week|month (calendar) or a --since form (7d, 24h).
