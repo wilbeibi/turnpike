@@ -12,18 +12,26 @@ never tell you about, so most of the work is getting the traffic through it and 
 ## Send traffic through it
 
 ```zsh
-eval $(turnpike config --provider openrouter)          # zsh/bash: exports the base URL
-turnpike config --provider xai --format fish | source  # fish
-turnpike config --provider gemini --format url         # bare URL, for code that takes base_url=
-turnpike config                                        # all providers (OpenAI-shaped ones share one var)
+turnpike config openrouter                    # the base URL, bare — for code taking base_url=
+eval $(turnpike config openrouter --shell)    # or set it in this shell, in $SHELL's syntax
+turnpike config --format json                 # every provider: url, port, path, env, status
 ```
 
 Keep the same API key and auth header — turnpike passes them upstream untouched, and
 the base URL is the only thing that changes. Always ask `turnpike config` for it; never
 type one from memory or copy one out of a README. Ports, paths, and env var names all
-differ per provider, and one with no base-URL convention (Gemini) prints nothing in
-shell format — take `--format url` and pass it in code (`google-genai`:
-`http_options={"base_url": ...}`).
+differ per provider, and one provider (Gemini) has no base-URL variable at all — pass
+its URL in code (`google-genai`: `http_options={"base_url": ...}`).
+
+Eight of the ten providers read `OPENAI_BASE_URL`, so exporting it routes exactly one
+of them; the port in the value is what says which. When several providers are in play
+in one script, set `base_url` per client in code instead of exporting.
+
+The `status` field (`this shell` column in the table) reports the environment turnpike
+was launched from: `routed` = a variable here points at turnpike, `direct` = a key is
+set with nothing pointing at turnpike, `in code` = a key is set for a provider with no
+variable to read, `-` = no key. `direct` is worth reporting to the user — that spend
+won't be metered unless the tool sets its base URL itself.
 
 Then say who is calling, or the spend lands under a runtime name:
 

@@ -108,16 +108,38 @@ tab or `tmux` window is fine while you're trying it out.
 
 ## Usage
 
-Point a tool at turnpike and use it exactly as before:
+Point a tool at turnpike and use it exactly as before. `turnpike config` is where
+you find out what to point it at:
 
 ```zsh
-eval $(turnpike config --provider openrouter)   # sets OPENAI_BASE_URL to http://127.0.0.1:4004/api/v1
-# fish:  turnpike config --provider xai --format fish | source
+turnpike config                           # every provider, and what this shell does with it
+turnpike config deepseek                  # http://127.0.0.1:4003/v1 — paste that into an app
+eval $(turnpike config deepseek --shell)  # or point this shell at it, in $SHELL's own syntax
 ```
 
-`turnpike config` with no provider lists every provider (the OpenAI-shaped ones share
-one base URL, so pick any); `turnpike config --format url` prints just the URLs. Scripts
-and coding agents should run that rather than copy a URL out of this README.
+Eight of the ten providers read `OPENAI_BASE_URL`, so only one of them can be routed
+by environment at a time — which is why an export needs a name, and why the bare
+table is worth a look. It says which one currently wins, and which keys are sitting
+here with nothing pointing at turnpike:
+
+```
+provider    base URL                  this shell
+----------  ------------------------  ----------
+openai      http://127.0.0.1:4000/v1  -
+deepseek    http://127.0.0.1:4003/v1  routed
+xai         http://127.0.0.1:4008/v1  direct
+```
+
+`routed` means a variable in this shell points at turnpike. `direct` means a key is
+set with nothing pointing at turnpike, so anything that takes its base URL from the
+environment will spend it unmetered. `-` means no key found. It's the environment
+turnpike was launched from, not a claim about the whole machine — a tool that sets
+its own base URL in code is invisible from out here, which is also why Gemini reads
+`in code` rather than a guess.
+
+Scripts and coding agents want `turnpike config --format json`: the same picture,
+plus each provider's port, path, key variables and upstream. Either beats copying a
+URL out of this README.
 
 Then read back what you used:
 
@@ -176,8 +198,8 @@ esac
 
 ### Providers and ports
 
-`turnpike config --provider <name>` sets the base URL for you, so you rarely type one
-by hand. When you do, address turnpike **by name**:
+`turnpike config <name>` prints the base URL, so you rarely type one by hand. When
+you do, you can address turnpike **by name**:
 
 ```
 http://<provider>.localhost:4000<path>     # e.g. http://openai.localhost:4000/v1
@@ -191,9 +213,10 @@ IPv6 loopback, so the name works whether the client reaches for `127.0.0.1` or `
 The `<path>` suffix mirrors each vendor's own API, so your SDK's base URL lines up
 with the endpoint it will call — that part is the vendor's, not turnpike's.
 
-Each provider also listens on its own fixed port, which is the form `turnpike config`
-emits and the fallback when a client won't resolve `*.localhost` (browsers and Linux
-do; macOS and slim containers sometimes don't) — `http://127.0.0.1:<port><path>`:
+Each provider also listens on its own fixed port. That's the form `turnpike config`
+prints, because it's the one that resolves everywhere: browsers and Linux handle
+`*.localhost`, macOS and slim containers sometimes don't. It's
+`http://127.0.0.1:<port><path>`:
 
 | Provider | Port | Path | Upstream |
 | --- | --- | --- | --- |

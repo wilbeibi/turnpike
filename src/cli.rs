@@ -1,3 +1,4 @@
+use crate::providers::PROVIDERS;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -82,14 +83,32 @@ pub enum Command {
         json: bool,
     },
 
-    /// Print configuration snippets for pointing clients at turnpike.
+    /// Print every provider's turnpike address and whether this shell routes
+    /// through it. Name a provider to get just its base URL.
     Config {
-        /// Limit output to one provider.
-        #[arg(short, long)]
+        /// Provider to print the base URL for, e.g. `turnpike config deepseek`.
+        #[arg(value_parser = provider_names())]
         provider: Option<String>,
 
-        #[arg(long, value_enum, default_value = "shell")]
-        format: Format,
+        /// Legacy spelling of the positional provider, kept because it also
+        /// keeps the legacy default of shell exports: `eval $(turnpike config
+        /// --provider openrouter)` from a published README must go on working.
+        #[arg(
+            short = 'p',
+            long = "provider",
+            hide = true,
+            value_parser = provider_names(),
+            conflicts_with = "provider"
+        )]
+        provider_flag: Option<String>,
+
+        /// Emit exports in $SHELL's own syntax:
+        /// `eval $(turnpike config openai --shell)`.
+        #[arg(long, conflicts_with = "format")]
+        shell: bool,
+
+        #[arg(long, value_enum)]
+        format: Option<Format>,
     },
 
     /// Manage the local pricing table.
@@ -109,9 +128,21 @@ pub enum PricesCmd {
 
 #[derive(ValueEnum, Clone)]
 pub enum Format {
-    Shell,
-    Fish,
-    Json,
-    /// Bare base URLs in the memorable `http://<provider>.localhost:4000` form.
+    /// Every provider, its base URL, and what this shell does with it.
+    Table,
+    /// Bare base URLs, `http://127.0.0.1:<port><path>` — the form that
+    /// resolves everywhere, including macOS and slim containers.
     Url,
+    /// `export` lines for POSIX shells, safe to `eval`.
+    Shell,
+    /// The same as `set -gx`, for fish.
+    Fish,
+    /// Every provider's url, port, path, key variables, upstream and status.
+    Json,
+}
+
+/// `--provider` accepts exactly the registry's names, so `--help` and the
+/// error on a wrong one are generated from the same list the proxy routes by.
+fn provider_names() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(PROVIDERS.iter().map(|p| p.name))
 }

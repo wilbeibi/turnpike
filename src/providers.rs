@@ -11,6 +11,12 @@ pub type MergeSse = fn(&str, &Value, &mut Usage);
 pub struct Provider {
     pub name: &'static str,
     pub upstream_url: &'static str,
+    /// Variables that hold this provider's API key, vendor's own spelling
+    /// first. A key present with nothing pointing at turnpike is spend this
+    /// meter will never see, which is what `turnpike config` reports; the
+    /// list is a best effort at the vendor's documented names, never a claim
+    /// that a key exists only where turnpike can see it.
+    pub key_envs: &'static [&'static str],
     pub default_port: u16,
     pub parse_json: ParseJson,
     /// Top-level non-streaming response field that carries usage accounting.
@@ -45,6 +51,7 @@ pub fn gemini_model_from_path(path: &str) -> Option<String> {
 pub static PROVIDERS: &[Provider] = &[
     Provider {
         name: "anthropic",
+        key_envs: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
         upstream_url: "https://api.anthropic.com",
         default_port: 4001,
         parse_json: parse_anthropic,
@@ -56,6 +63,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "openai",
+        key_envs: &["OPENAI_API_KEY"],
         upstream_url: "https://api.openai.com",
         default_port: 4000,
         parse_json: parse_openai,
@@ -67,6 +75,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "deepseek",
+        key_envs: &["DEEPSEEK_API_KEY"],
         upstream_url: "https://api.deepseek.com",
         default_port: 4003,
         parse_json: parse_openai,
@@ -78,6 +87,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "openrouter",
+        key_envs: &["OPENROUTER_API_KEY"],
         upstream_url: "https://openrouter.ai",
         default_port: 4004,
         parse_json: parse_openai,
@@ -89,6 +99,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "gemini",
+        key_envs: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         upstream_url: "https://generativelanguage.googleapis.com",
         default_port: 4002,
         parse_json: parse_gemini,
@@ -100,6 +111,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "kimi",
+        key_envs: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         upstream_url: "https://api.moonshot.ai",
         default_port: 4005,
         parse_json: parse_openai,
@@ -111,6 +123,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "minimax",
+        key_envs: &["MINIMAX_API_KEY"],
         upstream_url: "https://api.minimaxi.com",
         default_port: 4006,
         parse_json: parse_openai,
@@ -122,6 +135,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "glm",
+        key_envs: &["ZHIPUAI_API_KEY", "GLM_API_KEY"],
         upstream_url: "https://open.bigmodel.cn",
         default_port: 4007,
         parse_json: parse_openai,
@@ -133,6 +147,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "xai",
+        key_envs: &["XAI_API_KEY"],
         upstream_url: "https://api.x.ai",
         default_port: 4008,
         parse_json: parse_openai,
@@ -144,6 +159,7 @@ pub static PROVIDERS: &[Provider] = &[
     },
     Provider {
         name: "groq",
+        key_envs: &["GROQ_API_KEY"],
         upstream_url: "https://api.groq.com",
         default_port: 4009,
         parse_json: parse_openai,

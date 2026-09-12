@@ -73,15 +73,23 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Config { format, provider } => config::run(
-            match format {
+        Command::Config {
+            provider,
+            provider_flag,
+            shell,
+            format,
+        } => config::run(config::ConfigOpts {
+            legacy_provider_flag: provider_flag.is_some(),
+            provider: provider.or(provider_flag),
+            shell_syntax: shell,
+            format: format.map(|f| match f {
+                cli::Format::Table => config::ConfigFormat::Table,
+                cli::Format::Url => config::ConfigFormat::Url,
                 cli::Format::Shell => config::ConfigFormat::Shell,
                 cli::Format::Fish => config::ConfigFormat::Fish,
                 cli::Format::Json => config::ConfigFormat::Json,
-                cli::Format::Url => config::ConfigFormat::Url,
-            },
-            provider.as_deref(),
-        )?,
+            }),
+        })?,
         Command::Prices { cmd } => match cmd {
             cli::PricesCmd::Pull => pricing::pull(&paths::prices_json()).await?,
             cli::PricesCmd::Show => pricing::show(&paths::prices_json(), &paths::calls_db()),
