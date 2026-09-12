@@ -196,6 +196,51 @@ esac
 # just run `turnpike check` and branch on the exit code
 ```
 
+### Is anything bypassing turnpike?
+
+The meter only sees what's pointed at it, so the question worth asking every so
+often is what isn't. `turnpike doctor` answers from the two places it can see
+without touching anything: the keys in this shell, and the configuration files on
+disk.
+
+```zsh
+turnpike doctor
+```
+```
+this shell — 1 key not routed
+  deepseek  DEEPSEEK_API_KEY set; OPENAI_BASE_URL not set        http://127.0.0.1:4003/v1
+  gemini    GEMINI_API_KEY set; base URL lives in code — unknown from here
+
+config files — 2 name a vendor host
+  2026-09-09  ~/.config/opencode/opencode.json  api.deepseek.com
+  2026-08-22  ~/.hermes/.env                    openrouter.ai  (also names turnpike)
+
+scanned ~/.config ~/.zshrc ~/.claude ~/.codex ~/.hermes ~/.local/bin — 2612 files, 40.8 MB, 1.6 s
+this shell is the environment turnpike doctor ran in, not every process on the machine;
+a file naming a vendor host is where to look, not proof of a leak.
+```
+
+The first section is the `this shell` column of `turnpike config`, reduced to what
+needs a decision: a key here that nothing routes, and the URL that would. The second
+is a byte search over the usual configuration roots — `~/.config`, the shell startup
+files, the agent homes (`~/.claude`, `~/.codex`, `~/.hermes`, ...), `~/.local/bin`, and
+on macOS `~/Library/Application Support` — for any file that names a vendor host. It
+reports the path and the host, never the line, because the line is where the key
+sits. Prose, transcripts, logs, caches, backups, databases, compiled binaries,
+installed SDKs and source checkouts are skipped: each of them names every host, and
+none of them is what a tool reads at startup. A file that also names a turnpike
+address is marked rather than hidden — it may be a comment, a fallback, or a line you
+already fixed.
+
+Exit codes follow `check`: `0` nothing found, `1` findings, `2` error, `3` incomplete
+(the scan hit its size limit before finishing — the report still prints, it just
+can't vouch for what it didn't read). `--json` gives the same report with the roots,
+skip rules and skipped checkouts included, so a coding agent can tell what wasn't
+looked at.
+
+Doctor reads and changes nothing. What it reports is where to look, not what to run:
+it doesn't know your tools' config formats and doesn't try to.
+
 ### Providers and ports
 
 `turnpike config <name>` prints the base URL, so you rarely type one by hand. When

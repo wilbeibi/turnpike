@@ -1,6 +1,6 @@
 ---
 name: turnpike
-description: Meter local LLM API spend with the `turnpike` CLI — point a tool or script at the local proxy so its calls are recorded and attributed, then read the money back with `stats`, `tail`, and `check`. Use when writing or running anything that calls an OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Kimi, MiniMax, GLM, xAI, or Groq API from this machine, when asked what a tool or model cost, when a budget gate is wanted in a hook or cron job, or when a call isn't showing up in turnpike. Do NOT use for a full spend teardown or cheaper-model advice (use turnpike-spend-review), and not for subscription tools like Claude Code or Codex, which never pass through turnpike.
+description: Meter local LLM API spend with the `turnpike` CLI — point a tool or script at the local proxy so its calls are recorded and attributed, then read the money back with `stats`, `tail`, and `check`, and ask `doctor` what is bypassing it. Use when writing or running anything that calls an OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter, Kimi, MiniMax, GLM, xAI, or Groq API from this machine, when asked what a tool or model cost, when a budget gate is wanted in a hook or cron job, when a call isn't showing up in turnpike, or when asked whether some tool or key is spending unmetered. Do NOT use for a full spend teardown or cheaper-model advice (use turnpike-spend-review), and not for subscription tools like Claude Code or Codex, which never pass through turnpike.
 ---
 
 # turnpike
@@ -56,11 +56,12 @@ turnpike stats --since 7d         # by provider
 turnpike stats --by-tool          # best identity per call: header, else process, else UA
 turnpike stats --by-model         # or --by-client, --by-day, --by-exe (Linux only; one at a time)
 turnpike check --budget 50/day    # 0 under, 1 at/over, 2 error, 3 unknown
+turnpike doctor                   # what bypasses the meter: 0 clean, 1 findings, 2 error, 3 incomplete
 turnpike prices show              # rates in force for the models you actually call
 ```
 
 `--since` takes `30m`, `12h`, `7d`, `today`, `2026-07-01`, or an RFC-3339 instant.
-`--json` works on `stats`, `tail`, and `check`.
+`--json` works on `stats`, `tail`, `check`, and `doctor`.
 
 ## Operation
 
@@ -73,6 +74,13 @@ turnpike prices show              # rates in force for the models you actually c
   daemon that started before you did); is it an inference endpoint (model listings
   and probes are proxied but deliberately not logged); did the provider report usage
   at all (a `no_usage` row is recorded with no counts rather than guessed).
+- `turnpike doctor` is the first answer to "is anything bypassing turnpike?". It lists
+  keys in this shell that nothing routes (with the URL that would), and config files
+  that name a vendor host — path and host only, never the line, since that is where
+  the key sits. Treat a file hit as a place to open and read, not a fix to apply:
+  doctor does not know the tool's config format, and a file may name the vendor in a
+  comment or a fallback (it says when the file also names turnpike). The `--json`
+  report carries the roots and skip rules, so you can say what was *not* scanned.
 - `turnpike check` is a meter, not a notifier — branch on the exit code and send your
   own alert. Keep the four outcomes distinct: 3 is "can't vouch for the number yet"
   (no calls, or no price), not a pass and not a failure; 2 means the invocation or
