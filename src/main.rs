@@ -3,6 +3,7 @@ mod check;
 mod cli;
 mod config;
 mod cost;
+mod doctor;
 mod json_usage;
 mod parsers;
 mod paths;
@@ -11,6 +12,7 @@ mod pricing;
 mod providers;
 mod proxy;
 mod record;
+mod routing;
 mod since;
 mod sse;
 mod stats;
@@ -67,6 +69,19 @@ async fn main() -> anyhow::Result<()> {
                 Ok(check::Outcome::Under) => {}
                 Ok(check::Outcome::Over) => std::process::exit(1),
                 Ok(check::Outcome::Unknown) => std::process::exit(3),
+                Err(e) => {
+                    eprintln!("turnpike: {e:#}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Command::Doctor { json } => {
+            // Same shape as `check`: 1 is the branchable answer, 2 is broken,
+            // 3 is "could not vouch for a clean result" — a scan cut short.
+            match doctor::run(doctor::DoctorOpts { json }) {
+                Ok(doctor::Outcome::Clean) => {}
+                Ok(doctor::Outcome::Findings) => std::process::exit(1),
+                Ok(doctor::Outcome::Incomplete) => std::process::exit(3),
                 Err(e) => {
                     eprintln!("turnpike: {e:#}");
                     std::process::exit(2);

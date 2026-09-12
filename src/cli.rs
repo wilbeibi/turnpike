@@ -83,6 +83,15 @@ pub enum Command {
         json: bool,
     },
 
+    /// Find spend that bypasses turnpike: keys in this shell that nothing
+    /// routes, and config files that name a vendor host. Exit 0 nothing
+    /// found, 1 findings, 2 error, 3 incomplete (the scan was cut short).
+    Doctor {
+        /// Emit a JSON object instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print every provider's turnpike address and whether this shell routes
     /// through it. Name a provider to get just its base URL.
     Config {
