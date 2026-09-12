@@ -228,7 +228,8 @@ on macOS `~/Library/Application Support` — for any file that names a vendor ho
 reports the path and the host, never the line, because the line is where the key
 sits. Prose, transcripts, logs, caches, backups, databases, compiled binaries,
 installed SDKs and source checkouts are skipped: each of them names every host, and
-none of them is what a tool reads at startup. A file that also names a turnpike
+none of them is what a tool reads at startup. Symlinks are followed, so a config tree
+kept by stow or chezmoi is read where it lives. A file that also names a turnpike
 address is marked rather than hidden — it may be a comment, a fallback, or a line you
 already fixed.
 
@@ -247,7 +248,8 @@ bill vs meter — 1 gap flagged
 The first run only records a baseline. A reading rolls forward once it is a day old,
 so running doctor from a hook every session still gives you daily windows. A top-up
 resets the baseline. A bill in a currency turnpike doesn't meter in prints both
-numbers and no verdict; so does a window with unpriced calls. Each row says whether
+numbers and no verdict, unless nothing was metered at all, which is a gap in any
+currency. A window with unpriced calls has no verdict either. Each row says whether
 the metered figure is the provider's own cost or the local price table, because a
 small gap on the latter is pricing drift, not a leak. The figure is per key, so a key
 used on two machines will show a gap on each. `--offline` skips this section and
@@ -255,9 +257,11 @@ makes doctor a pure local read; deleting `doctor.json` starts the baseline over.
 
 Exit codes follow `check`: `0` nothing found, `1` findings (an unrouted key, a file, or
 a flagged gap), `2` error, `3` incomplete — some signal couldn't answer: the scan hit
-its size limit, a provider was unreachable, the baseline was just recorded, or a
-comparison had no verdict. The report still prints; it just can't vouch for what it
-didn't see. `--json` gives the same report with the roots, skip rules, skipped
+its size limit, a provider was unreachable, the baseline was just recorded, a window
+had unpriced calls, or the readings could not be kept. A currency mismatch is not
+incomplete: it is a limit of the meter, stated on the line, and an account funded in
+CNY would otherwise never exit `0` again. The report still prints; it just can't vouch
+for what it didn't see. `--json` gives the same report with the roots, skip rules, skipped
 checkouts and every bill row's status included, so a coding agent can tell what
 wasn't looked at.
 

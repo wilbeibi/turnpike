@@ -131,56 +131,84 @@ struct BillRow {
     status: Status,
 }
 
+struct Bills {
+    rows: Vec<BillRow>,
+    /// Why the readings could not be kept, when they could not. The rows
+    /// are still right for this run; the next one compares from the
+    /// previous reading, so it is incomplete rather than fatal.
+    unsaved: Option<String>,
+}
+
 /// Ask each source that has a key here, compare against the meter, and
-/// advance the stored reading. The state file is written once, at the end,
-/// and only if something in it changed.
-async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Vec<BillRow>> {
+/// advance the stored reading. Only unusable state is an error: anything
+/// that goes wrong on one row stays on that row, so the other two signals
+/// are never thrown away with it. The state file is written once, at the
+/// end, and only if something in it changed.
+async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Bills> {
     let state_path = doctor_json();
     let mut state = bill::State::load(&state_path)?;
     let client = reqwest::Client::builder().timeout(bill::TIMEOUT).build()?;
     let now = Timestamp::now().to_string();
+
+    // All sources at once: a black-holed network costs one timeout, not one
+    // per source.
+    let fetched = futures_util::future::join_all(bill::SOURCES.iter().map(|src| {
+        let client = &client;
+        async move {
+            let provider = PROVIDERS
+                .iter()
+                .find(|p| p.name == src.provider)
+                .expect("bill sources name known providers");
+            let key = key_var(provider, env).and_then(|v| env.get(v));
+            match (offline, key) {
+                (true, _) => Err(Status::Offline),
+                (false, None) => Err(Status::NoKey),
+                (false, Some(key)) => bill::fetch(client, src, key)
+                    .await
+                    .map_err(|e| Status::Unreachable(format!("{e:#}"))),
+            }
+        }
+    }))
+    .await;
+
     let mut rows = Vec::new();
     let mut changed = false;
     // Opened on first use: a baseline run never touches calls.db.
     let mut meter: Option<(rusqlite::Connection, PriceTable)> = None;
-
-    for src in bill::SOURCES {
-        let provider = PROVIDERS
-            .iter()
-            .find(|p| p.name == src.provider)
-            .expect("bill sources name known providers");
-        let key = key_var(provider, env).and_then(|v| env.get(v));
-        let status = match (offline, key) {
-            (true, _) => Status::Offline,
-            (false, None) => Status::NoKey,
-            (false, Some(key)) => match bill::fetch(&client, src, key).await {
-                Err(e) => Status::Unreachable(format!("{e:#}")),
-                Ok(reading) => {
-                    let prev = state.snapshots.get(src.provider);
-                    let (status, next) = bill::assess(prev, reading, &now, |since, until| {
-                        if meter.is_none() {
-                            meter = Some((open_db(&calls_db())?, PriceTable::load(&prices_json())));
-                        }
-                        let (conn, prices) = meter.as_ref().expect("just set");
-                        spend_between(conn, prices, Some(src.provider), since, Some(until))
-                    })?;
-                    if !prev.is_some_and(|p| p.ts == next.ts) {
-                        state.snapshots.insert(src.provider.to_string(), next);
-                        changed = true;
+    for (src, fetched) in bill::SOURCES.iter().zip(fetched) {
+        let status = match fetched {
+            Err(status) => status,
+            Ok(reading) => {
+                let prev = state.snapshots.get(src.provider);
+                let assessed = bill::assess(prev, reading, &now, |since, until| {
+                    if meter.is_none() {
+                        meter = Some((open_db(&calls_db())?, PriceTable::load(&prices_json())));
                     }
-                    status
+                    let (conn, prices) = meter.as_ref().expect("just set");
+                    spend_between(conn, prices, Some(src.provider), since, Some(until))
+                });
+                match assessed {
+                    Err(e) => Status::Failed(format!("{e:#}")),
+                    Ok((status, next)) => {
+                        if !prev.is_some_and(|p| p.ts == next.ts) {
+                            state.snapshots.insert(src.provider.to_string(), next);
+                            changed = true;
+                        }
+                        status
+                    }
                 }
-            },
+            }
         };
         rows.push(BillRow {
             provider: src.provider,
             status,
         });
     }
-    if changed {
-        state.save(&state_path)?;
-    }
-    Ok(rows)
+    let unsaved = match changed {
+        true => state.save(&state_path).err().map(|e| format!("{e:#}")),
+        false => None,
+    };
+    Ok(Bills { rows, unsaved })
 }
 
 pub async fn run(opts: DoctorOpts) -> Result<Outcome> {
@@ -194,19 +222,23 @@ pub async fn run(opts: DoctorOpts) -> Result<Outcome> {
             .cmp(&a.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
-    let bills = bill_rows(&env, opts.offline).await?;
+    let Bills {
+        rows: bills,
+        unsaved,
+    } = bill_rows(&env, opts.offline).await?;
 
     let direct = rows.iter().filter(|r| r.status == Routing::Direct).count();
     let flagged = bills
         .iter()
         .filter(|b| matches!(&b.status, Status::Compared(c) if c.flagged))
         .count();
-    let incomplete = report.truncated || bills.iter().any(|b| b.status.incomplete());
+    let incomplete =
+        report.truncated || unsaved.is_some() || bills.iter().any(|b| b.status.incomplete());
     let outcome = classify(direct, report.hits.len(), flagged, incomplete);
     let home = env.get("HOME").map(String::as_str);
 
     if opts.json {
-        print_json(&rows, &report, &bills, outcome);
+        print_json(&rows, &report, &bills, unsaved.as_deref(), outcome);
     } else {
         print_text(&rows, &report, &bills, home);
     }
@@ -215,6 +247,9 @@ pub async fn run(opts: DoctorOpts) -> Result<Outcome> {
             "warning: scan stopped after {} — the report is incomplete",
             megabytes(report.bytes)
         );
+    }
+    if let Some(e) = &unsaved {
+        eprintln!("warning: readings not kept: {e} — the next run compares from the previous ones");
     }
     Ok(outcome)
 }
@@ -350,6 +385,7 @@ fn print_bills(bills: &[BillRow]) {
             Status::NoKey => "no key in this shell".to_string(),
             Status::Offline => "skipped (--offline)".to_string(),
             Status::Unreachable(e) => format!("unreachable: {e}"),
+            Status::Failed(e) => format!("could not compare: {e}"),
             Status::Baseline => "baseline recorded; run again after some spend".to_string(),
             Status::Reset(why) => format!("{why} since last reading; baseline reset"),
             Status::Compared(c) => comparison_line(c),
@@ -388,6 +424,9 @@ fn comparison_line(c: &Comparison) -> String {
         c.metered_source
     );
     match c.no_verdict {
+        Some("currency_mismatch") if c.flagged => {
+            line.push_str("   nothing metered in any currency  flagged")
+        }
         Some("currency_mismatch") => line.push_str("   currencies differ; no verdict"),
         Some(_) => {
             line.push_str(&format!(
@@ -396,8 +435,10 @@ fn comparison_line(c: &Comparison) -> String {
             ));
         }
         None => {
-            line.push_str(&format!("   gap ${:.2}", c.gap));
-            if let Some(pct) = c.gap_pct {
+            // A meter a fraction of a cent above the bill is not "-0.00".
+            let gap = if c.gap.abs() < 0.005 { 0.0 } else { c.gap };
+            line.push_str(&format!("   gap ${gap:.2}"));
+            if let Some(pct) = c.gap_pct.filter(|_| gap != 0.0) {
                 line.push_str(&format!(" ({pct:.0}%)"));
             }
             if c.flagged {
@@ -441,7 +482,13 @@ fn local_minute(ts: &str) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
-fn print_json(rows: &[EnvRow], report: &Report, bills: &[BillRow], outcome: Outcome) {
+fn print_json(
+    rows: &[EnvRow],
+    report: &Report,
+    bills: &[BillRow],
+    unsaved: Option<&str>,
+    outcome: Outcome,
+) {
     let env: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -474,7 +521,7 @@ fn print_json(rows: &[EnvRow], report: &Report, bills: &[BillRow], outcome: Outc
                 "status": b.status.label(),
             });
             match &b.status {
-                Status::Unreachable(e) => row["error"] = e.as_str().into(),
+                Status::Unreachable(e) | Status::Failed(e) => row["error"] = e.as_str().into(),
                 Status::Reset(why) => row["reason"] = (*why).into(),
                 Status::Compared(c) => {
                     row["since"] = c.since.as_str().into();
@@ -499,9 +546,11 @@ fn print_json(rows: &[EnvRow], report: &Report, bills: &[BillRow], outcome: Outc
         "env": env,
         "config": config,
         "bill": bill,
+        "bill_state_error": unsaved,
         "scan": {
             "roots": report.roots,
             "skip_dirs": scan::SKIP_DIRS,
+            "skip_root_dirs": scan::SKIP_ROOT_DIRS,
             "skip_dir_words": scan::SKIP_DIR_WORDS,
             "skip_file_words": scan::SKIP_FILE_WORDS,
             "skip_exts": scan::SKIP_EXTS,
@@ -611,9 +660,17 @@ mod tests {
         c.foreign.insert("CNY".to_string(), 18.4);
         c.billed = 0.0;
         c.no_verdict = Some("currency_mismatch");
+        c.flagged = false;
         let line = comparison_line(&c);
         assert!(line.starts_with("¥18.40 billed"), "{line}");
         assert!(line.ends_with("currencies differ; no verdict"), "{line}");
+
+        c.flagged = true;
+        let line = comparison_line(&c);
+        assert!(
+            line.ends_with("nothing metered in any currency  flagged"),
+            "{line}"
+        );
     }
 
     #[test]

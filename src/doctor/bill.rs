@@ -218,7 +218,9 @@ pub struct Comparison {
     pub gap: f64,
     pub gap_pct: Option<f64>,
     /// Why no verdict, when there is none: `currency_mismatch` or
-    /// `unpriced_calls`. The numbers are still printed.
+    /// `unpriced_calls`. The numbers are still printed. A currency mismatch
+    /// with nothing metered at all is still flagged: that gap exists in any
+    /// currency.
     pub no_verdict: Option<&'static str>,
     pub flagged: bool,
 }
@@ -245,6 +247,8 @@ pub fn compare(
         None
     };
     let threshold = (billed * THRESHOLD_PCT / 100.0).max(THRESHOLD_USD);
+    let spent_unmetered =
+        meter.total == 0.0 && meter.unpriced == 0 && foreign.values().any(|a| *a > THRESHOLD_USD);
     Comparison {
         since: since.to_string(),
         until: until.to_string(),
@@ -260,7 +264,7 @@ pub fn compare(
         gap,
         gap_pct,
         no_verdict,
-        flagged: no_verdict.is_none() && gap > threshold,
+        flagged: (no_verdict.is_none() && gap > threshold) || spent_unmetered,
     }
 }
 
@@ -270,6 +274,9 @@ pub enum Status {
     NoKey,
     Offline,
     Unreachable(String),
+    /// The provider answered but the local side could not: `calls.db` would
+    /// not open, or the reading could not be kept.
+    Failed(String),
     Baseline,
     Reset(&'static str),
     Compared(Comparison),
@@ -281,6 +288,7 @@ impl Status {
             Status::NoKey => "no_key",
             Status::Offline => "offline",
             Status::Unreachable(_) => "unreachable",
+            Status::Failed(_) => "failed",
             Status::Baseline => "baseline",
             Status::Reset(_) => "reset",
             Status::Compared(_) => "compared",
@@ -288,11 +296,14 @@ impl Status {
     }
 
     /// True when this row could not deliver a verdict for a reason that is
-    /// not the user's choice. `NoKey` and `Offline` are not incomplete.
+    /// not the user's choice. `NoKey` and `Offline` are not incomplete, and
+    /// neither is a currency mismatch: that is a limit of the meter stated
+    /// on the line, not a question left unanswered, and an account funded in
+    /// CNY would otherwise never exit 0 again.
     pub fn incomplete(&self) -> bool {
         match self {
             Status::NoKey | Status::Offline => false,
-            Status::Compared(c) => c.no_verdict.is_some(),
+            Status::Compared(c) => c.unpriced > 0,
             _ => true,
         }
     }
@@ -468,6 +479,18 @@ mod tests {
         let c = compare("a", "b", &spent, &spend(2.31, 0, 3));
         assert_eq!(c.no_verdict, Some("currency_mismatch"));
         assert!(!c.flagged);
+        // A mismatch is a stated limit, not an open question.
+        assert!(!Status::Compared(c.clone()).incomplete());
+        // ...unless nothing was metered at all: that gap exists in any currency.
+        let c = compare("a", "b", &spent, &spend(0.0, 0, 0));
+        assert_eq!(c.no_verdict, Some("currency_mismatch"));
+        assert!(c.flagged);
+        // Nothing metered because nothing was priced is not that, and
+        // unpriced calls keep the run incomplete whatever the currency.
+        let c = compare("a", "b", &spent, &spend(0.0, 2, 0));
+        assert!(!c.flagged);
+        assert!(Status::Compared(c.clone()).incomplete());
+        assert!(Status::Failed("x".into()).incomplete());
         assert_eq!(c.foreign["CNY"], 18.4);
         assert_eq!(c.billed, 0.0);
 
