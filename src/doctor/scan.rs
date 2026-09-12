@@ -11,7 +11,7 @@
 //! than a clean one.
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,6 @@ pub const SKIP_DIRS: &[&str] = &[
     "Service Worker",
     "blob_storage",
     "IndexedDB",
-    "projects",
     "sessions",
     "file-history",
     "transcripts",
@@ -69,6 +68,11 @@ pub const SKIP_DIRS: &[&str] = &[
     ".tmp",
     "temp",
 ];
+
+/// Directories skipped only directly under the named root. Claude Code's
+/// per-project transcripts and tool results sit under a name any other tool
+/// might use for its per-project configuration, so the skip is not global.
+pub const SKIP_ROOT_DIRS: &[&str] = &[".claude/projects"];
 
 /// A directory whose name contains one of these is a copy of something
 /// else: `cache`, `Code Cache`, `.curator_backups`, `state-snapshots`.
@@ -269,16 +273,19 @@ pub fn scan(
         host_count,
         limits,
         report: &mut report,
+        visited: HashSet::new(),
+        root_name: String::new(),
     };
     'roots: for root in roots {
-        // Symlinked roots are followed on purpose (`~/.config` itself may be
-        // one); symlinks *inside* a tree are not, so a link back up cannot
-        // loop the walk and a link out of it cannot widen it.
         let Ok(meta) = fs::metadata(root) else {
             continue;
         };
         walker.report.roots.push(root.clone());
         let stop = if meta.is_dir() {
+            walker.root_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             walker.dir(root, 0)
         } else {
             walker.file(root, &meta)
@@ -298,12 +305,25 @@ struct Walker<'a> {
     host_count: usize,
     limits: &'a Limits,
     report: &'a mut Report,
+    /// Every directory entered, by canonical path, so one reached twice —
+    /// through a link, or as two roots — is read once and a link back up
+    /// cannot loop the walk.
+    visited: HashSet<PathBuf>,
+    /// File name of the root being walked, for [`SKIP_ROOT_DIRS`].
+    root_name: String,
 }
 
 impl Walker<'_> {
     /// Returns true when the total-bytes limit was hit and the walk must stop.
     fn dir(&mut self, dir: &Path, depth: usize) -> bool {
         if depth > self.limits.max_depth {
+            return false;
+        }
+        let Ok(canonical) = fs::canonicalize(dir) else {
+            self.report.unreadable += 1;
+            return false;
+        };
+        if !self.visited.insert(canonical) {
             return false;
         }
         let Ok(entries) = fs::read_dir(dir) else {
@@ -314,18 +334,34 @@ impl Walker<'_> {
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = entry.path();
-            // `symlink_metadata` so a link is seen as a link and skipped.
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 self.report.unreadable += 1;
                 continue;
             };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
+            // Links are followed: a dotfile manager may keep every config
+            // file behind one. Only regular files and directories on the far
+            // end count, so a link to a device or socket is never opened. A
+            // link out of the tree is bounded by depth and total bytes like
+            // everything else.
+            let meta = if meta.file_type().is_symlink() {
+                match fs::metadata(&path) {
+                    Ok(target) if target.is_file() || target.is_dir() => target,
+                    _ => continue,
+                }
+            } else {
+                meta
+            };
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if meta.is_dir() {
                 if skip_dir(&name) {
+                    continue;
+                }
+                if depth == 0
+                    && SKIP_ROOT_DIRS.iter().any(|s| {
+                        s.strip_prefix(self.root_name.as_str()) == Some(&format!("/{name}"))
+                    })
+                {
                     continue;
                 }
                 if is_checkout(&path) {
@@ -566,8 +602,6 @@ mod tests {
         big.resize(200, b' ');
         write(&root.join("big.json"), &big);
         write(&root.join("real.json"), host);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(root.join("real.json"), root.join("link.json")).unwrap();
 
         let limits = Limits {
             max_file_bytes: 100,
@@ -579,6 +613,60 @@ mod tests {
             vec![("real.json".to_string(), vec!["api.deepseek.com"])]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_followed_once_and_never_to_a_device() {
+        use std::os::unix::fs::symlink;
+        let root = tmp();
+        let host = b"https://api.deepseek.com";
+        // A dotfile manager's layout: the file and the directory are both
+        // links to somewhere outside the root.
+        let store = tmp();
+        write(&store.join("opencode.json"), host);
+        write(&store.join("tool/config.toml"), host);
+        symlink(store.join("opencode.json"), root.join("opencode.json")).unwrap();
+        symlink(store.join("tool"), root.join("tool")).unwrap();
+        // The same directory reached a second way, and a link back up.
+        symlink(store.join("tool"), root.join("tool-again")).unwrap();
+        symlink(&root, root.join("up")).unwrap();
+        symlink("/dev/zero", root.join("zero")).unwrap();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+
+        let r = scan(
+            std::slice::from_ref(&root),
+            &needles(),
+            &[],
+            &Limits::default(),
+        );
+        let mut got = labels(&r);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("config.toml".to_string(), vec!["api.deepseek.com"]),
+                ("opencode.json".to_string(), vec!["api.deepseek.com"]),
+            ]
+        );
+        assert_eq!(r.files, 2);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(store).unwrap();
+    }
+
+    #[test]
+    fn root_relative_skips_apply_only_under_that_root() {
+        let base = tmp();
+        let host = b"https://api.deepseek.com";
+        write(&base.join(".claude/projects/p/tool-results/x.json"), host);
+        write(&base.join(".claude/settings.json"), host);
+        write(&base.join(".gemini/config/projects/y.json"), host);
+        let roots = [base.join(".claude"), base.join(".gemini")];
+        let r = scan(&roots, &needles(), &[], &Limits::default());
+        let mut got: Vec<String> = labels(&r).into_iter().map(|(n, _)| n).collect();
+        got.sort();
+        assert_eq!(got, vec!["settings.json", "y.json"]);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
