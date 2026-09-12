@@ -1,7 +1,8 @@
 //! `turnpike doctor` — answer "what on this machine spends money without going
 //! through turnpike?" without configuring anything. It reads the environment
-//! and walks configuration files; it changes nothing and never touches the
-//! forward path. Two signals today:
+//! and walks configuration files, and asks the two providers that expose a
+//! spend figure how much a key really spent; it changes nothing and never
+//! touches the forward path. Three signals:
 //!
 //! 1. **This shell.** Every provider whose key is set here with nothing
 //!    pointing at turnpike — the `this shell` column of `turnpike config`,
@@ -10,18 +11,30 @@
 //! 2. **Config files.** Every file under the usual configuration roots that
 //!    names a vendor host (`api.deepseek.com`, ...). Path and host only —
 //!    never the line, because the line is where the key sits.
+//! 3. **Bill vs meter.** DeepSeek's balance and OpenRouter's key usage,
+//!    against what turnpike metered for that provider since the previous
+//!    reading (see [`bill`]). The one signal that needs a network; `--offline`
+//!    turns it off.
 //!
 //! Exit codes follow `check`'s shape, because callers already know it:
-//! `0` nothing found, `1` findings, `2` error, `3` incomplete — the scan was
-//! cut short, so a clean report could not be vouched for. Findings beat
-//! incomplete: a leak found in a partial scan is still a leak.
+//! `0` nothing found, `1` findings, `2` error, `3` incomplete — a signal could
+//! not answer (scan cut short, provider unreachable, no baseline yet), so a
+//! clean report cannot be vouched for. Findings beat incomplete: a leak found
+//! in a partial scan is still a leak.
 
+pub mod bill;
 pub mod scan;
 
 use crate::config::base_url;
+use crate::cost::spend_between;
+use crate::paths::{calls_db, doctor_json, prices_json};
+use crate::pricing::PriceTable;
 use crate::providers::{Provider, PROVIDERS};
+use crate::record::open_db;
 use crate::routing::{base_url_env, key_var, routing, Routing};
 use anyhow::Result;
+use bill::{Comparison, Status};
+use jiff::tz::TimeZone;
 use jiff::Timestamp;
 use scan::{Hit, Limits, Needle, Report};
 use std::collections::HashMap;
@@ -29,6 +42,7 @@ use std::path::Path;
 
 pub struct DoctorOpts {
     pub json: bool,
+    pub offline: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,17 +116,74 @@ fn needles() -> Vec<Needle> {
 /// Findings beat incomplete beats clean — the same priority `check` gives
 /// over-budget against unknown. A partial scan that already found something
 /// has answered the question.
-fn classify(direct: usize, hits: usize, truncated: bool) -> Outcome {
-    if direct > 0 || hits > 0 {
+fn classify(direct: usize, hits: usize, flagged: usize, incomplete: bool) -> Outcome {
+    if direct > 0 || hits > 0 || flagged > 0 {
         Outcome::Findings
-    } else if truncated {
+    } else if incomplete {
         Outcome::Incomplete
     } else {
         Outcome::Clean
     }
 }
 
-pub fn run(opts: DoctorOpts) -> Result<Outcome> {
+struct BillRow {
+    provider: &'static str,
+    status: Status,
+}
+
+/// Ask each source that has a key here, compare against the meter, and
+/// advance the stored reading. The state file is written once, at the end,
+/// and only if something in it changed.
+async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Vec<BillRow>> {
+    let state_path = doctor_json();
+    let mut state = bill::State::load(&state_path)?;
+    let client = reqwest::Client::builder().timeout(bill::TIMEOUT).build()?;
+    let now = Timestamp::now().to_string();
+    let mut rows = Vec::new();
+    let mut changed = false;
+    // Opened on first use: a baseline run never touches calls.db.
+    let mut meter: Option<(rusqlite::Connection, PriceTable)> = None;
+
+    for src in bill::SOURCES {
+        let provider = PROVIDERS
+            .iter()
+            .find(|p| p.name == src.provider)
+            .expect("bill sources name known providers");
+        let key = key_var(provider, env).and_then(|v| env.get(v));
+        let status = match (offline, key) {
+            (true, _) => Status::Offline,
+            (false, None) => Status::NoKey,
+            (false, Some(key)) => match bill::fetch(&client, src, key).await {
+                Err(e) => Status::Unreachable(format!("{e:#}")),
+                Ok(reading) => {
+                    let prev = state.snapshots.get(src.provider);
+                    let (status, next) = bill::assess(prev, reading, &now, |since, until| {
+                        if meter.is_none() {
+                            meter = Some((open_db(&calls_db())?, PriceTable::load(&prices_json())));
+                        }
+                        let (conn, prices) = meter.as_ref().expect("just set");
+                        spend_between(conn, prices, Some(src.provider), since, Some(until))
+                    })?;
+                    if !prev.is_some_and(|p| p.ts == next.ts) {
+                        state.snapshots.insert(src.provider.to_string(), next);
+                        changed = true;
+                    }
+                    status
+                }
+            },
+        };
+        rows.push(BillRow {
+            provider: src.provider,
+            status,
+        });
+    }
+    if changed {
+        state.save(&state_path)?;
+    }
+    Ok(rows)
+}
+
+pub async fn run(opts: DoctorOpts) -> Result<Outcome> {
     let env: HashMap<String, String> = std::env::vars().collect();
     let rows = env_rows(&env);
     let roots = scan::default_roots(&env);
@@ -123,15 +194,21 @@ pub fn run(opts: DoctorOpts) -> Result<Outcome> {
             .cmp(&a.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
+    let bills = bill_rows(&env, opts.offline).await?;
 
     let direct = rows.iter().filter(|r| r.status == Routing::Direct).count();
-    let outcome = classify(direct, report.hits.len(), report.truncated);
+    let flagged = bills
+        .iter()
+        .filter(|b| matches!(&b.status, Status::Compared(c) if c.flagged))
+        .count();
+    let incomplete = report.truncated || bills.iter().any(|b| b.status.incomplete());
+    let outcome = classify(direct, report.hits.len(), flagged, incomplete);
     let home = env.get("HOME").map(String::as_str);
 
     if opts.json {
-        print_json(&rows, &report, outcome);
+        print_json(&rows, &report, &bills, outcome);
     } else {
-        print_text(&rows, &report, home);
+        print_text(&rows, &report, &bills, home);
     }
     if report.truncated {
         eprintln!(
@@ -142,7 +219,7 @@ pub fn run(opts: DoctorOpts) -> Result<Outcome> {
     Ok(outcome)
 }
 
-fn print_text(rows: &[EnvRow], report: &Report, home: Option<&str>) {
+fn print_text(rows: &[EnvRow], report: &Report, bills: &[BillRow], home: Option<&str>) {
     let direct: Vec<&EnvRow> = rows
         .iter()
         .filter(|r| r.status == Routing::Direct)
@@ -215,6 +292,8 @@ fn print_text(rows: &[EnvRow], report: &Report, home: Option<&str>) {
     }
     println!();
 
+    print_bills(bills);
+
     let roots: Vec<String> = report.roots.iter().map(|r| display_path(r, home)).collect();
     println!(
         "scanned {} — {} files, {}, {:.1} s",
@@ -235,9 +314,134 @@ fn print_text(rows: &[EnvRow], report: &Report, home: Option<&str>) {
         "this shell is the environment turnpike doctor ran in, not every process on the machine;"
     );
     println!("a file naming a vendor host is where to look, not proof of a leak.");
+    if bills
+        .iter()
+        .any(|b| matches!(b.status, Status::Compared(_)))
+    {
+        println!("usage is per key; a key used on more than one host over-reports here.");
+    }
 }
 
-fn print_json(rows: &[EnvRow], report: &Report, outcome: Outcome) {
+fn print_bills(bills: &[BillRow]) {
+    if bills.iter().all(|b| matches!(b.status, Status::Offline)) {
+        println!("bill vs meter — skipped (--offline)\n");
+        return;
+    }
+    if bills.iter().all(|b| matches!(b.status, Status::NoKey)) {
+        let names: Vec<&str> = bills.iter().map(|b| b.provider).collect();
+        println!(
+            "bill vs meter — no {} key in this shell\n",
+            names.join(" or ")
+        );
+        return;
+    }
+    let flagged = bills
+        .iter()
+        .filter(|b| matches!(&b.status, Status::Compared(c) if c.flagged))
+        .count();
+    match flagged {
+        0 => println!("bill vs meter"),
+        1 => println!("bill vs meter — 1 gap flagged"),
+        n => println!("bill vs meter — {n} gaps flagged"),
+    }
+    let w = bills.iter().map(|b| b.provider.len()).max().unwrap_or(0);
+    for b in bills {
+        let line = match &b.status {
+            Status::NoKey => "no key in this shell".to_string(),
+            Status::Offline => "skipped (--offline)".to_string(),
+            Status::Unreachable(e) => format!("unreachable: {e}"),
+            Status::Baseline => "baseline recorded; run again after some spend".to_string(),
+            Status::Reset(why) => format!("{why} since last reading; baseline reset"),
+            Status::Compared(c) => comparison_line(c),
+        };
+        println!("  {:<w$}  {line}", b.provider);
+    }
+    if bills
+        .iter()
+        .any(|b| matches!(b.status, Status::Compared(_)))
+    {
+        println!(
+            "  (flagged when the gap exceeds {}% of the bill or ${:.2}, whichever is larger)",
+            bill::THRESHOLD_PCT,
+            bill::THRESHOLD_USD
+        );
+    }
+    println!();
+}
+
+fn comparison_line(c: &Comparison) -> String {
+    let mut billed: Vec<String> = Vec::new();
+    if c.billed > 0.0 || c.foreign.is_empty() {
+        billed.push(money("USD", c.billed));
+    }
+    for (code, amt) in &c.foreign {
+        billed.push(money(code, *amt));
+    }
+    let mut line = format!(
+        "{} billed since {}{}   metered ${:.2} ({})",
+        billed.join(" + "),
+        local_minute(&c.since),
+        bill::age(&c.since, &c.until)
+            .map(|d| format!(" ({})", window(d)))
+            .unwrap_or_default(),
+        c.metered,
+        c.metered_source
+    );
+    match c.no_verdict {
+        Some("currency_mismatch") => line.push_str("   currencies differ; no verdict"),
+        Some(_) => {
+            line.push_str(&format!(
+                "   {} unpriced calls; no verdict — run `turnpike prices pull`",
+                c.unpriced
+            ));
+        }
+        None => {
+            line.push_str(&format!("   gap ${:.2}", c.gap));
+            if let Some(pct) = c.gap_pct {
+                line.push_str(&format!(" ({pct:.0}%)"));
+            }
+            if c.flagged {
+                line.push_str("  flagged");
+            }
+        }
+    }
+    line
+}
+
+/// A window length at the precision a person reads it: minutes under an
+/// hour, hours under two days, days after.
+fn window(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 2 * 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+fn money(code: &str, amount: f64) -> String {
+    match code {
+        "USD" => format!("${amount:.2}"),
+        "CNY" => format!("¥{amount:.2}"),
+        _ => format!("{amount:.2} {code}"),
+    }
+}
+
+/// An RFC-3339 instant as a local wall-clock minute; the raw string if it
+/// will not parse, which only happens to an edited state file.
+fn local_minute(ts: &str) -> String {
+    ts.parse::<Timestamp>()
+        .map(|t| {
+            t.to_zoned(TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+fn print_json(rows: &[EnvRow], report: &Report, bills: &[BillRow], outcome: Outcome) {
     let env: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -262,10 +466,39 @@ fn print_json(rows: &[EnvRow], report: &Report, outcome: Outcome) {
             })
         })
         .collect();
+    let bill: Vec<serde_json::Value> = bills
+        .iter()
+        .map(|b| {
+            let mut row = serde_json::json!({
+                "provider": b.provider,
+                "status": b.status.label(),
+            });
+            match &b.status {
+                Status::Unreachable(e) => row["error"] = e.as_str().into(),
+                Status::Reset(why) => row["reason"] = (*why).into(),
+                Status::Compared(c) => {
+                    row["since"] = c.since.as_str().into();
+                    row["until"] = c.until.as_str().into();
+                    row["billed"] = c.billed.into();
+                    row["foreign"] = serde_json::to_value(&c.foreign).expect("map of floats");
+                    row["metered"] = c.metered.into();
+                    row["metered_source"] = c.metered_source.into();
+                    row["unpriced_calls"] = c.unpriced.into();
+                    row["gap"] = c.gap.into();
+                    row["gap_pct"] = c.gap_pct.into();
+                    row["no_verdict"] = c.no_verdict.into();
+                    row["flagged"] = c.flagged.into();
+                }
+                _ => {}
+            }
+            row
+        })
+        .collect();
     let out = serde_json::json!({
         "status": outcome.label(),
         "env": env,
         "config": config,
+        "bill": bill,
         "scan": {
             "roots": report.roots,
             "skip_dirs": scan::SKIP_DIRS,
@@ -321,10 +554,11 @@ mod tests {
 
     #[test]
     fn findings_beat_incomplete_beat_clean() {
-        assert_eq!(classify(0, 0, false), Outcome::Clean);
-        assert_eq!(classify(0, 0, true), Outcome::Incomplete);
-        assert_eq!(classify(1, 0, true), Outcome::Findings);
-        assert_eq!(classify(0, 1, false), Outcome::Findings);
+        assert_eq!(classify(0, 0, 0, false), Outcome::Clean);
+        assert_eq!(classify(0, 0, 0, true), Outcome::Incomplete);
+        assert_eq!(classify(1, 0, 0, true), Outcome::Findings);
+        assert_eq!(classify(0, 1, 0, false), Outcome::Findings);
+        assert_eq!(classify(0, 0, 1, true), Outcome::Findings);
     }
 
     #[test]
@@ -353,6 +587,33 @@ mod tests {
         assert!(labels.contains(&"api.deepseek.com"));
         assert!(labels.contains(&"openrouter.ai"));
         assert!(labels.iter().all(|l| !l.contains("://")));
+    }
+
+    #[test]
+    fn a_comparison_line_names_the_meter_source_and_the_verdict() {
+        let mut c = bill::compare(
+            "2026-09-04T14:02:00Z",
+            "2026-09-11T00:00:00Z",
+            &std::collections::BTreeMap::from([("USD".to_string(), 2.93)]),
+            &crate::cost::Spend {
+                total: 1.65,
+                unpriced: 0,
+                reported: 4,
+                computed: 0,
+            },
+        );
+        let line = comparison_line(&c);
+        assert!(line.starts_with("$2.93 billed since 2026-09-04"), "{line}");
+        assert!(line.contains(" (6d)   metered"), "{line}");
+        assert!(line.contains("metered $1.65 (provider-reported)"), "{line}");
+        assert!(line.ends_with("gap $1.28 (44%)  flagged"), "{line}");
+
+        c.foreign.insert("CNY".to_string(), 18.4);
+        c.billed = 0.0;
+        c.no_verdict = Some("currency_mismatch");
+        let line = comparison_line(&c);
+        assert!(line.starts_with("¥18.40 billed"), "{line}");
+        assert!(line.ends_with("currencies differ; no verdict"), "{line}");
     }
 
     #[test]
