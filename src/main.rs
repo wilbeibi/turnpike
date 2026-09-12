@@ -75,10 +75,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Doctor { json } => {
+        Command::Doctor { json, offline } => {
             // Same shape as `check`: 1 is the branchable answer, 2 is broken,
-            // 3 is "could not vouch for a clean result" — a scan cut short.
-            match doctor::run(doctor::DoctorOpts { json }) {
+            // 3 is "could not vouch for a clean result" — a scan cut short,
+            // a provider unreachable, or no baseline yet.
+            match doctor::run(doctor::DoctorOpts { json, offline }).await {
                 Ok(doctor::Outcome::Clean) => {}
                 Ok(doctor::Outcome::Findings) => std::process::exit(1),
                 Ok(doctor::Outcome::Incomplete) => std::process::exit(3),

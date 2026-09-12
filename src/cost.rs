@@ -5,7 +5,9 @@
 
 use crate::pricing::PriceTable;
 use crate::record::Usage;
+use anyhow::Result;
 use jiff::Timestamp;
+use rusqlite::Connection;
 
 /// Build a `Usage` for cost accounting from the four token columns as they are
 /// stored (`i64`, `0` meaning absent). `cost` is deliberately left `None` so
@@ -55,4 +57,80 @@ pub fn call_cost(
     } else {
         Some(0.0)
     }
+}
+
+/// A window's spend and how it was priced.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Spend {
+    /// USD, with unpriced calls counted as $0 — see `unpriced`.
+    pub total: f64,
+    /// Token-bearing calls that had no price. Summed as $0, so a caller must
+    /// say the real figure may be higher rather than pass this off as exact.
+    pub unpriced: i64,
+    /// Calls priced from the provider's own reported cost.
+    pub reported: i64,
+    /// Calls priced from the local table.
+    pub computed: i64,
+}
+
+/// Spend for calls with `lower <= ts` (and `ts < upper`, when given),
+/// optionally for one provider. `check` and `doctor` both sum through here so
+/// a window means the same thing to each.
+pub fn spend_between(
+    conn: &Connection,
+    prices: &PriceTable,
+    provider: Option<&str>,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<Spend> {
+    let mut sql = String::from(
+        "SELECT model,
+                COALESCE(input_tokens, 0),
+                COALESCE(output_tokens, 0),
+                COALESCE(cache_read_input_tokens, 0),
+                COALESCE(cache_creation_input_tokens, 0),
+                cost,
+                ts
+         FROM calls
+         WHERE ts >= ?1",
+    );
+    let mut params: Vec<String> = vec![lower.to_string()];
+    if let Some(p) = provider {
+        params.push(p.to_string());
+        sql.push_str(&format!(" AND provider = ?{}", params.len()));
+    }
+    if let Some(u) = upper {
+        params.push(u.to_string());
+        sql.push_str(&format!(" AND ts < ?{}", params.len()));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Option<f64>>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+
+    let mut spend = Spend::default();
+    for row in rows {
+        let (model, input, output, cache_read, cache_write, stored, ts) = row?;
+        let usage = usage_from_counts(input, output, cache_read, cache_write);
+        match call_cost(prices, model.as_deref(), stored, &usage, priced_at(&ts)) {
+            Some(c) => {
+                spend.total += c;
+                if stored.is_some() {
+                    spend.reported += 1;
+                } else if c > 0.0 {
+                    spend.computed += 1;
+                }
+            }
+            None => spend.unpriced += 1,
+        }
+    }
+    Ok(spend)
 }

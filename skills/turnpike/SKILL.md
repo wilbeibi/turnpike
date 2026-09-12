@@ -57,6 +57,7 @@ turnpike stats --by-tool          # best identity per call: header, else process
 turnpike stats --by-model         # or --by-client, --by-day, --by-exe (Linux only; one at a time)
 turnpike check --budget 50/day    # 0 under, 1 at/over, 2 error, 3 unknown
 turnpike doctor                   # what bypasses the meter: 0 clean, 1 findings, 2 error, 3 incomplete
+turnpike doctor --offline         # same, without asking DeepSeek/OpenRouter what the key spent
 turnpike prices show              # rates in force for the models you actually call
 ```
 
@@ -81,6 +82,12 @@ turnpike prices show              # rates in force for the models you actually c
   doctor does not know the tool's config format, and a file may name the vendor in a
   comment or a fallback (it says when the file also names turnpike). The `--json`
   report carries the roots and skip rules, so you can say what was *not* scanned.
+  The `bill vs meter` rows compare DeepSeek's balance and OpenRouter's key usage
+  against the meter since the stored reading (`doctor.json` beside `calls.db`,
+  rolls daily, delete to restart). The first run is a baseline and exits 3 — not a
+  failure, run it again later. A flagged gap means the key spent through something
+  turnpike never saw; a gap on a `price table` row under a few percent is pricing
+  drift. Use `--offline` when a key must not be sent anywhere.
 - `turnpike check` is a meter, not a notifier — branch on the exit code and send your
   own alert. Keep the four outcomes distinct: 3 is "can't vouch for the number yet"
   (no calls, or no price), not a pass and not a failure; 2 means the invocation or

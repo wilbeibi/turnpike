@@ -21,7 +21,7 @@
 //! even when other calls are unpriced — missing data can't make an
 //! already-exceeded budget un-exceeded.
 
-use crate::cost::{call_cost, priced_at, usage_from_counts};
+use crate::cost::spend_between;
 use crate::paths::{calls_db, prices_json};
 use crate::pricing::PriceTable;
 use crate::record::open_db;
@@ -173,40 +173,8 @@ pub fn run(opts: CheckOpts) -> Result<Outcome> {
 /// Total USD spent since `lower`, and the count of token-bearing calls that had
 /// no price (summed as $0, so a caller can warn that spend may be higher).
 fn sum_spend(conn: &Connection, prices: &PriceTable, lower: &str) -> Result<(f64, i64)> {
-    let mut stmt = conn.prepare(
-        "SELECT model,
-                COALESCE(input_tokens, 0),
-                COALESCE(output_tokens, 0),
-                COALESCE(cache_read_input_tokens, 0),
-                COALESCE(cache_creation_input_tokens, 0),
-                cost,
-                ts
-         FROM calls
-         WHERE ts >= ?1",
-    )?;
-    let rows = stmt.query_map([lower], |r| {
-        Ok((
-            r.get::<_, Option<String>>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, i64>(3)?,
-            r.get::<_, i64>(4)?,
-            r.get::<_, Option<f64>>(5)?,
-            r.get::<_, String>(6)?,
-        ))
-    })?;
-
-    let mut spent = 0.0;
-    let mut unpriced = 0i64;
-    for row in rows {
-        let (model, input, output, cache_read, cache_write, stored, ts) = row?;
-        let usage = usage_from_counts(input, output, cache_read, cache_write);
-        match call_cost(prices, model.as_deref(), stored, &usage, priced_at(&ts)) {
-            Some(c) => spent += c,
-            None => unpriced += 1,
-        }
-    }
-    Ok((spent, unpriced))
+    let s = spend_between(conn, prices, None, lower, None)?;
+    Ok((s.total, s.unpriced))
 }
 
 /// Resolve a budget period to an RFC-3339 UTC lower bound. `day` / `week` /

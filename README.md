@@ -232,14 +232,38 @@ none of them is what a tool reads at startup. A file that also names a turnpike
 address is marked rather than hidden — it may be a comment, a fallback, or a line you
 already fixed.
 
-Exit codes follow `check`: `0` nothing found, `1` findings, `2` error, `3` incomplete
-(the scan hit its size limit before finishing — the report still prints, it just
-can't vouch for what it didn't read). `--json` gives the same report with the roots,
-skip rules and skipped checkouts included, so a coding agent can tell what wasn't
-looked at.
+The third section is the bill itself, for the two providers that will tell a key what
+it spent: DeepSeek's balance and OpenRouter's key usage. Doctor stores each reading
+in `doctor.json` next to `calls.db`, and on the next run compares what moved against
+what turnpike metered for that provider over the same window:
 
-Doctor reads and changes nothing. What it reports is where to look, not what to run:
-it doesn't know your tools' config formats and doesn't try to.
+```
+bill vs meter — 1 gap flagged
+  openrouter  $2.93 billed since 2026-09-04 14:02 (6d)   metered $1.65 (provider-reported)   gap $1.28 (44%)  flagged
+  deepseek    ¥18.40 billed since 2026-09-04 14:02 (6d)  metered $2.31 (price table)         currencies differ; no verdict
+  (flagged when the gap exceeds 5% of the bill or $0.05, whichever is larger)
+```
+
+The first run only records a baseline. A reading rolls forward once it is a day old,
+so running doctor from a hook every session still gives you daily windows. A top-up
+resets the baseline. A bill in a currency turnpike doesn't meter in prints both
+numbers and no verdict; so does a window with unpriced calls. Each row says whether
+the metered figure is the provider's own cost or the local price table, because a
+small gap on the latter is pricing drift, not a leak. The figure is per key, so a key
+used on two machines will show a gap on each. `--offline` skips this section and
+makes doctor a pure local read; deleting `doctor.json` starts the baseline over.
+
+Exit codes follow `check`: `0` nothing found, `1` findings (an unrouted key, a file, or
+a flagged gap), `2` error, `3` incomplete — some signal couldn't answer: the scan hit
+its size limit, a provider was unreachable, the baseline was just recorded, or a
+comparison had no verdict. The report still prints; it just can't vouch for what it
+didn't see. `--json` gives the same report with the roots, skip rules, skipped
+checkouts and every bill row's status included, so a coding agent can tell what
+wasn't looked at.
+
+Doctor changes nothing on the machine and sends nothing but a key to its own
+provider's balance endpoint. What it reports is where to look, not what to run: it
+doesn't know your tools' config formats and doesn't try to.
 
 ### Providers and ports
 

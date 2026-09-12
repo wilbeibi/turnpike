@@ -17,6 +17,11 @@ pub fn prices_json() -> PathBuf {
     data_dir().join("prices.json")
 }
 
+/// `turnpike doctor`'s last provider readings. User data: delete to reset.
+pub fn doctor_json() -> PathBuf {
+    data_dir().join("doctor.json")
+}
+
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)

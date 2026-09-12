@@ -84,12 +84,16 @@ pub enum Command {
     },
 
     /// Find spend that bypasses turnpike: keys in this shell that nothing
-    /// routes, and config files that name a vendor host. Exit 0 nothing
-    /// found, 1 findings, 2 error, 3 incomplete (the scan was cut short).
+    /// routes, config files that name a vendor host, and the provider's own
+    /// bill against the meter. Exit 0 nothing found, 1 findings, 2 error,
+    /// 3 incomplete (a signal could not answer).
     Doctor {
         /// Emit a JSON object instead of the report.
         #[arg(long)]
         json: bool,
+        /// Skip the bill-vs-meter check; no network at all.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Print every provider's turnpike address and whether this shell routes

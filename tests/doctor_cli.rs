@@ -2,6 +2,9 @@
 //! turnpike?", so it is exercised as a process against a planted home
 //! directory. `env_clear` matters twice over: the developer's real keys would
 //! show up as findings, and the developer's real `~/.config` would be walked.
+//! Every run that plants a key passes `--offline`, so a planted key is never
+//! sent anywhere, and `XDG_DATA_HOME` points into the planted home so the
+//! developer's own `doctor.json` is neither read nor written.
 
 use std::fs;
 use std::io::Write;
@@ -90,6 +93,7 @@ fn doctor(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_turnpike"));
     cmd.arg("doctor").args(args).env_clear();
     cmd.env("HOME", home.path());
+    cmd.env("XDG_DATA_HOME", home.path().join("data"));
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -115,7 +119,57 @@ fn a_clean_home_exits_zero_and_says_none() {
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("no unrouted keys"), "{stdout}");
     assert!(stdout.contains("none name a vendor host"), "{stdout}");
+    assert!(
+        stdout.contains("no deepseek or openrouter key in this shell"),
+        "{stdout}"
+    );
     assert!(stdout.contains("scanned"), "{stdout}");
+    // Nothing to remember, so no state file appears.
+    assert!(!home.path().join("data/turnpike/doctor.json").exists());
+}
+
+#[test]
+fn offline_skips_the_bill_check_without_touching_the_network_or_state() {
+    let home = Home::empty();
+    let out = doctor(
+        &home,
+        &["--json", "--offline"],
+        &[
+            ("DEEPSEEK_API_KEY", PLANTED_KEY),
+            ("OPENROUTER_API_KEY", PLANTED_KEY),
+        ],
+    );
+    // Two direct keys are findings; offline is not incomplete.
+    assert_eq!(out.status.code(), Some(1));
+    let v = json(&out);
+    let bill = v["bill"].as_array().unwrap();
+    assert_eq!(bill.len(), 2);
+    assert!(bill.iter().all(|b| b["status"] == "offline"), "{bill:?}");
+    assert!(!home.path().join("data/turnpike/doctor.json").exists());
+
+    let (stdout, _) = text(&doctor(
+        &home,
+        &["--offline"],
+        &[("DEEPSEEK_API_KEY", PLANTED_KEY)],
+    ));
+    assert!(
+        stdout.contains("bill vs meter — skipped (--offline)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(PLANTED_KEY));
+}
+
+#[test]
+fn a_corrupt_state_file_is_an_error_that_names_the_fix() {
+    let home = Home::empty();
+    home.write("data/turnpike/doctor.json", b"{ not json");
+    // The bill check is what reads state, and it runs even with no key, so
+    // a broken file is reported before anything is fetched.
+    let out = doctor(&home, &[], &[]);
+    let (_, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("doctor.json"), "{stderr}");
+    assert!(stderr.contains("delete it to reset"), "{stderr}");
 }
 
 #[test]
@@ -155,7 +209,7 @@ fn config_hits_are_findings_named_by_path_and_host_only() {
 #[test]
 fn an_unrouted_key_in_this_shell_is_a_finding_with_the_fix() {
     let home = Home::empty();
-    let out = doctor(&home, &[], &[("DEEPSEEK_API_KEY", PLANTED_KEY)]);
+    let out = doctor(&home, &["--offline"], &[("DEEPSEEK_API_KEY", PLANTED_KEY)]);
     let (stdout, stderr) = text(&out);
     assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
     assert!(stdout.contains("1 key not routed"), "{stdout}");
@@ -169,7 +223,7 @@ fn a_routed_key_is_not_a_finding() {
     let home = Home::empty();
     let out = doctor(
         &home,
-        &["--json"],
+        &["--json", "--offline"],
         &[
             ("DEEPSEEK_API_KEY", "k"),
             ("OPENAI_BASE_URL", "http://127.0.0.1:4003/v1"),
@@ -197,7 +251,11 @@ fn gemini_is_reported_as_unknown_not_flagged() {
 #[test]
 fn json_carries_what_an_agent_needs() {
     let home = Home::leaky();
-    let out = doctor(&home, &["--json"], &[("OPENROUTER_API_KEY", PLANTED_KEY)]);
+    let out = doctor(
+        &home,
+        &["--json", "--offline"],
+        &[("OPENROUTER_API_KEY", PLANTED_KEY)],
+    );
     assert_eq!(out.status.code(), Some(1));
     let v = json(&out);
     assert_eq!(v["status"], "findings");
@@ -223,6 +281,10 @@ fn json_carries_what_an_agent_needs() {
     assert_eq!(by_name("000005.ldb")["hosts"][0], "openrouter.ai");
     assert_eq!(by_name("fixed.toml")["names_turnpike"], true);
     assert!(by_name("fixed.toml")["modified"].is_string());
+
+    let bill = v["bill"].as_array().unwrap();
+    assert_eq!(bill[0]["provider"], "deepseek");
+    assert_eq!(bill[0]["status"], "offline");
 
     let scan = &v["scan"];
     assert_eq!(scan["truncated"], false);
