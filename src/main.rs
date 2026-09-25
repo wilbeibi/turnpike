@@ -3,6 +3,7 @@ mod check;
 mod cli;
 mod config;
 mod cost;
+mod custody;
 mod doctor;
 mod json_usage;
 mod parsers;

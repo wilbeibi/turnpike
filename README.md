@@ -304,6 +304,49 @@ prints, because it's the one that resolves everywhere: browsers and Linux handle
 | xAI | 4008 | `/v1` | `https://api.x.ai` |
 | Groq | 4009 | `/openai/v1` | `https://api.groq.com` |
 
+### Keeping keys in one place
+
+Every tool with its own copy of a key is one more place to update when you rotate
+it. If you'd rather tools never see the real key, give turnpike the keys and give
+the tools a placeholder, a *sentinel*. turnpike swaps it for the real key on the
+way out.
+
+Put the keys in `~/.config/turnpike/keys.env`, mode 600. They use the vendor's
+own variable names, so you can also source the file by hand:
+
+```zsh
+# ~/.config/turnpike/keys.env
+DEEPSEEK_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+# one sentinel per tool; make one with: print tp-$(openssl rand -hex 16)
+TURNPIKE_SENTINEL_OPENCODE=tp-7c1e...
+```
+
+Comments go on their own line. A `#` after a value is a parse error, because a
+shell would read it differently from turnpike.
+
+Then give the tool the sentinel wherever it used to take the key, for example
+`DEEPSEEK_API_KEY=tp-7c1e...`. The sentinel isn't tied to a provider, so a tool can
+use the same one on every port. turnpike sends each request the key of the
+provider it's going to, so one vendor's key never reaches another vendor.
+
+- **Real keys still work.** A key that isn't a `tp-` sentinel passes through
+  untouched, so you can move tools over one at a time.
+- **Unknown sentinels are refused** with a 401 and never leave the machine. The same
+  happens when there's no key for that provider, or when `keys.env` is missing or
+  broken.
+- **Rotating a key.** Edit the file and save it. turnpike picks up the change within
+  a couple of seconds, with no restart. Requests already in flight finish on the
+  old key. If a save has a mistake, turnpike logs it and keeps using the last good
+  file.
+- **Keeping the old key.** When you rotate, rename the old key to
+  `DEEPSEEK_API_KEY_PREVIOUS`. turnpike never sends it. It's there so you can put it
+  back if the new key turns out to be bad.
+
+If turnpike is down, a tool holding a sentinel can't reach the provider directly.
+Load the real key from the file into your shell and unset the base URL:
+`export DEEPSEEK_API_KEY="$(. ~/.config/turnpike/keys.env; print -r -- $DEEPSEEK_API_KEY)"`.
+
 ## Cost
 
 Costs come from what the provider reports. When a provider doesn't report one,
@@ -417,7 +460,7 @@ There are bigger tools in this space. Most of them do more than you need for
 | **LiteLLM / gateways** | routing, load balancing, key vaults, fallbacks | holds your keys, rewrites requests, one endpoint for everything — a mistyped model can land on the wrong provider |
 | **Helicone, Langfuse, Braintrust** | hosted LLM observability, traces, prompt history | your prompts leave the machine, and you get an account, a dashboard, and a bill |
 | **Provider dashboards** | the numbers the vendor already has | one per provider, a day late, and no idea which local tool made the call |
-| **turnpike** | a local meter, one SQLite file | doesn't route, cache, retry, or hold keys — if you want a gateway, this isn't one |
+| **turnpike** | a local meter, one SQLite file | doesn't route, cache, or retry, and holds keys only if you ask — if you want a gateway, this isn't one |
 
 The short version: if you want a control plane, use LiteLLM. If you want a trace
 viewer for a production app, use Langfuse. If you want to know which thing on your
@@ -425,8 +468,9 @@ laptop spent $40 last Tuesday, that's this.
 
 ## Boundaries
 
-- A meter, not a gateway. It doesn't route, balance, cache, retry, hold budgets,
-  or store your keys.
+- A meter, not a gateway. It doesn't route, balance, cache, retry, or hold budgets.
+  It holds your keys only if you write a `keys.env`, and then it only swaps them
+  into the auth header.
 - Local only. Listeners bind loopback (`127.0.0.1` and `::1`), never `0.0.0.0`;
   nothing is network-exposed.
 - Usage metadata only. No prompt or response bodies, ever.
