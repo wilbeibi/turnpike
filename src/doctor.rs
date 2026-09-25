@@ -165,8 +165,18 @@ async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Bills
     let client = reqwest::Client::builder().timeout(bill::TIMEOUT).build()?;
     let now = Timestamp::now().to_string();
     // Under custody the environment holds sentinels and the keys live in
-    // keys.env; a missing or broken file just means no custody keys here.
-    let custody = crate::custody::load(&crate::paths::keys_env()).ok();
+    // keys.env. A missing file means no custody here; a broken one is said
+    // out loud, since the proxy is refusing sentinels for the same reason.
+    let keys_env = crate::paths::keys_env();
+    let custody = match crate::custody::load(&keys_env) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            if keys_env.exists() {
+                eprintln!("warning: keys.env not loaded: {e:#}");
+            }
+            None
+        }
+    };
     let custody = custody.as_ref();
 
     // All sources at once: a black-holed network costs one timeout, not one
