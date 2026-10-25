@@ -570,8 +570,16 @@ impl PriceTable {
         let (input_per_m, output_per_m, cache_read_per_m, cache_creation_per_m) =
             rates.effective_rates(context_tokens, at);
 
+        // Cache-included providers count reads inside input_tokens; some
+        // (OpenRouter) count writes there too. Decide per response: if input
+        // covers both, both are a breakdown of it; otherwise the write is
+        // additive and billed only at the write rate.
         let non_cached_input = if prices.cache_in_input {
-            input.saturating_sub(cache_read) as f64
+            if input >= cache_read + cache_creation {
+                (input - cache_read - cache_creation) as f64
+            } else {
+                input.saturating_sub(cache_read) as f64
+            }
         } else {
             input as f64
         };
@@ -1234,6 +1242,42 @@ mod tests {
         // Hand-derived: 80k * 3.0/M + 20k * 0.3/M + 5k * 3.75/M + 50k * 15.0/M
         // = 0.24 + 0.006 + 0.01875 + 0.75.
         assert!((cost - 1.01475).abs() < 1e-12);
+    }
+
+    fn openrouter_table() -> PriceTable {
+        let json = r#"{
+            "openai/gpt-6.1-sol": {"input_per_m":2.0,"output_per_m":8.0,"cache_read_per_m":0.2,
+                "cache_creation_per_m":2.5,"cache_in_input":true}
+        }"#;
+        PriceTable::from_json(json).unwrap()
+    }
+
+    #[test]
+    fn subset_cache_write_is_not_double_billed() {
+        // Real OpenRouter row: input 4701 = 3 uncached + 3109 read + 1589 write.
+        let u = usage(4701, 0, 3109, 1589);
+        let cost = openrouter_table()
+            .compute(Some("openai/gpt-6.1-sol"), &u, whenever())
+            .unwrap();
+        // Hand-derived: 3 * 2.0/M + 3109 * 0.2/M + 1589 * 2.5/M
+        // = 0.000006 + 0.0006218 + 0.0039725.
+        assert!((cost - 0.0046003).abs() < 1e-12);
+        // Subtracting only the read would also bill the 1589 write tokens at
+        // the input rate.
+        let read_only = (4701.0 - 3109.0) * 2.0 / 1e6 + 0.0006218 + 0.0039725;
+        assert!(cost < read_only);
+    }
+
+    #[test]
+    fn cache_write_outside_input_is_still_billed() {
+        // read + write exceed input, so the write cannot be inside it.
+        let u = usage(1000, 0, 800, 500);
+        let cost = openrouter_table()
+            .compute(Some("openai/gpt-6.1-sol"), &u, whenever())
+            .unwrap();
+        // Hand-derived: 200 * 2.0/M + 800 * 0.2/M + 500 * 2.5/M
+        // = 0.0004 + 0.00016 + 0.00125.
+        assert!((cost - 0.00181).abs() < 1e-12);
     }
 
     #[test]
