@@ -9,7 +9,7 @@ use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri};
 use axum::response::Response;
 use axum::Router;
 use bytes::Bytes;
@@ -258,7 +258,13 @@ async fn handle_request(
         .upstream_override
         .as_deref()
         .unwrap_or(provider.upstream_url);
-    let upstream = format!("{base}{uri}");
+    let Some(upstream) = upstream_url(base, &uri) else {
+        warn!(
+            "turnpike [{}]: request target has no path; refusing to forward",
+            provider.name
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    };
 
     let mut upstream_req = state
         .client
@@ -788,6 +794,14 @@ fn provider_from_host(headers: &HeaderMap, authority: Option<&str>) -> HostRoute
     }
 }
 
+/// The upstream URL is the provider's base plus the client's path and query,
+/// never the client's scheme or authority: an absolute- or authority-form
+/// request target must not pick the host that receives a custody key.
+fn upstream_url(base: &str, uri: &Uri) -> Option<String> {
+    let pq = uri.path_and_query()?.as_str();
+    pq.starts_with('/').then(|| format!("{base}{pq}"))
+}
+
 /// Client identity for per-tool attribution: `x-turnpike-client` when the
 /// caller sets one, else the request `User-Agent`. Returns the value plus
 /// its provenance — "header" (declared) or "ua" (fallback) — because
@@ -1044,6 +1058,28 @@ mod tests {
         ] {
             assert!(!is_inference_endpoint(e), "{e} should be skipped");
         }
+    }
+
+    #[test]
+    fn request_target_cannot_choose_the_upstream_host() {
+        let base = "https://api.deepseek.com";
+        let at = |t: &str| upstream_url(base, &t.parse().unwrap());
+        assert_eq!(
+            at("/v1/chat/completions?x=1").as_deref(),
+            Some("https://api.deepseek.com/v1/chat/completions?x=1")
+        );
+        for absolute in [
+            "x.attacker.example://foo/v1/chat/completions",
+            "https://attacker.example/v1/chat/completions",
+        ] {
+            assert_eq!(
+                at(absolute).as_deref(),
+                Some("https://api.deepseek.com/v1/chat/completions"),
+                "{absolute}"
+            );
+        }
+        assert_eq!(at(".attacker.example:443"), None);
+        assert_eq!(at("*"), None);
     }
 
     fn host_route(host: Option<&str>, authority: Option<&str>) -> HostRoute {

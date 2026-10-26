@@ -4,6 +4,7 @@ use crate::cli::{KeySetArgs, KeysCmd};
 use crate::custody::{self, Custody, Status, MAX_FILE_BYTES};
 use crate::providers::{Provider, PROVIDERS};
 use anyhow::{bail, Context, Result};
+use log::warn;
 use rustix::fs::{flock, FlockOperation, Mode, OFlags};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -52,7 +53,17 @@ pub(crate) fn serve_status(custody: Arc<Custody>, path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     tokio::spawn(async move {
         let _guard = guard;
-        while let Ok((mut stream, _)) = listener.accept().await {
+        loop {
+            // An accept error (EMFILE, say) must not end status for the
+            // daemon's lifetime; back off and keep serving.
+            let mut stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    warn!("turnpike: key status socket accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let bytes = serde_json::to_vec(&custody.status()).expect("status is serializable");
             let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes)).await;
         }
@@ -185,7 +196,7 @@ impl Drop for EchoGuard {
     }
 }
 
-fn input(from_stdin: bool) -> Result<String> {
+async fn input(from_stdin: bool) -> Result<String> {
     let stdin = std::io::stdin();
     let mut text = String::new();
     if from_stdin {
@@ -200,6 +211,10 @@ fn input(from_stdin: bool) -> Result<String> {
         if !stdin.is_terminal() {
             bail!("pipe a key with --stdin, or run in a terminal");
         }
+        // Ctrl-C's default action would exit past EchoGuard and leave the
+        // terminal silent, so take SIGINT before echo goes off.
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let original = rustix::termios::tcgetattr(&stdin)?;
         let mut hidden = original.clone();
         hidden.local_modes.remove(rustix::termios::LocalModes::ECHO);
@@ -207,7 +222,21 @@ fn input(from_stdin: bool) -> Result<String> {
         let _guard = EchoGuard(original);
         eprint!("New provider key: ");
         std::io::stderr().flush()?;
-        stdin.lock().take(MAX_FILE_BYTES + 1).read_line(&mut text)?;
+        let line = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .take(MAX_FILE_BYTES + 1)
+                .read_line(&mut line)
+                .map(|_| line)
+        });
+        tokio::select! {
+            line = line => text = line??,
+            _ = interrupt.recv() => {
+                eprintln!();
+                bail!("cancelled; nothing was written");
+            }
+        }
         eprintln!();
     }
     let key = text.trim_end_matches(['\r', '\n']);
@@ -261,7 +290,7 @@ async fn execute(cmd: KeysCmd, path: &Path, socket: &Path) -> Result<Report> {
         ),
     };
     let key = if action == "set" {
-        Some(input(from_stdin)?)
+        Some(input(from_stdin).await?)
     } else {
         None
     };

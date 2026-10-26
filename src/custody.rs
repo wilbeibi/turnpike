@@ -296,7 +296,7 @@ fn split_credential<'a>(
 ) -> Option<(Option<&'a str>, &'a str)> {
     let s = v.to_str().ok()?.trim();
     if *name == header::AUTHORIZATION {
-        let (scheme, token) = s.split_once(' ')?;
+        let (scheme, token) = s.split_once([' ', '\t'])?;
         scheme
             .eq_ignore_ascii_case("bearer")
             .then(|| (Some(scheme), token.trim()))
@@ -529,6 +529,11 @@ mod tests {
         let mut h = headers(&[("authorization", &format!("bearer {S1}"))]);
         apply(&mut h, provider("deepseek"), Some(&m)).unwrap();
         assert_eq!(h["authorization"], "bearer sk-fake-deepseek");
+        // A tab is legal whitespace after the scheme; the sentinel must not
+        // slip past unswapped because of it.
+        let mut h = headers(&[("authorization", &format!("Bearer\t{S1}"))]);
+        apply(&mut h, provider("deepseek"), Some(&m)).unwrap();
+        assert_eq!(h["authorization"], "Bearer sk-fake-deepseek");
     }
 
     #[test]

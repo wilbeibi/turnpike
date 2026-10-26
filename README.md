@@ -311,88 +311,71 @@ it. If you'd rather tools never see the real key, give turnpike the keys and giv
 the tools a placeholder, a *sentinel*. turnpike swaps it for the real key on the
 way out.
 
-Install a provider key with a hidden terminal prompt:
+Hand turnpike a key. It asks for it at a hidden prompt:
 
 ```zsh
 turnpike set-key deepseek
 turnpike key status
 ```
 
-The first install creates `~/.config/turnpike/keys.env` with mode 600 and one random
-default sentinel. Additional providers share that sentinel. To configure a tool,
-load the sentinel into its key variable and point its base URL at turnpike:
+The first time, this creates `~/.config/turnpike/keys.env` (mode 600) with one random
+sentinel, `TURNPIKE_SENTINEL_DEFAULT`, which every provider you add shares. Give the
+tool the sentinel wherever it used to take the key, and point it at turnpike:
 
 ```zsh
 export DEEPSEEK_API_KEY="$(. ~/.config/turnpike/keys.env; print -r -- "$TURNPIKE_SENTINEL_DEFAULT")"
-# For an OpenAI-compatible DeepSeek client:
 export OPENAI_BASE_URL="$(turnpike config deepseek)"
 ```
 
-Configure each tool once, then refresh its environment. Later rotations require
-no tool restarts. Real keys still pass through unchanged during migration.
-Per-tool sentinels remain optional for separate revocation; their labels do not
-provide usage attribution. Use `x-turnpike-client` for that.
+The sentinel isn't tied to a provider. turnpike sends each request the key of the
+provider it's going to, so one vendor's key never reaches another vendor.
 
-Run `set-key` again to rotate. It validates the file format, retains the old key
-in `_PREVIOUS`, and atomically replaces the file. turnpike reloads within about
-two seconds. In-flight requests finish with their original credential.
-Repeating a set with the current key leaves the file and rollback slot unchanged.
-turnpike never retries with the previous key.
+- **Real keys still work.** A key that isn't a `tp-` sentinel passes through
+  untouched, so you can move tools over one at a time.
+- **Unknown sentinels are refused** with a 401 and never leave the machine. The same
+  happens when there's no key for that provider, or when `keys.env` is missing or
+  broken.
+- **Rotating a key.** Run `set-key` again. The old key moves to
+  `DEEPSEEK_API_KEY_PREVIOUS`, turnpike picks up the new one within a couple of
+  seconds, and no tool needs a restart. Requests already in flight finish on the
+  old key. turnpike never sends the previous key, even when the new one fails.
+- **Going back.** `turnpike key status --json` shows the file's `revision`, and
+  `turnpike key rollback deepseek --expect-revision <revision>` swaps the two keys.
+  Running it again with the same revision fails instead of swapping them back.
 
-For agents, pipe secret bytes directly from a trusted helper into
-`turnpike set-key deepseek --stdin --json`. For example, to install an existing
-environment credential without printing it:
+To move a key that's already in your environment without printing it, pipe it in.
+Never put a key in a command's arguments, where shell history keeps it.
 
 ```zsh
-print -rn -- "$DEEPSEEK_API_KEY" | turnpike set-key deepseek --stdin --json
+print -rn -- "$DEEPSEEK_API_KEY" | turnpike set-key deepseek --stdin
 ```
 
-Use this before replacing that environment value with a sentinel. Never paste
-keys into arguments, agent messages, or commands recorded in shell history.
+For scripts and agents, `--json` says what changed and never prints a key or
+sentinel. Exit 0 means the running turnpike has loaded the new file, 2 means the
+command failed, and 3 means the file was saved but turnpike didn't confirm it within
+`--wait` seconds (five by default), so check `key status`.
 
-`--json` reports `revision`, `changed`, `activation`, `rollback_available`, and
-any file or daemon reload error. It never prints keys or sentinels. Activation
-comes from the running daemon over a private, read-only Unix socket. Exit codes:
+turnpike checks the file, not the key. After a rotation, make one small call before
+you revoke the old key at the vendor.
 
-| Code | Meaning |
-|---|---|
-| 0 | The daemon reports the requested revision loaded. |
-| 2 | The operation failed; inspect the JSON `error` or stderr. |
-| 3 | Activation is unconfirmed. A set may already be saved; inspect `revision` and run `key status`. |
-
-`--wait 0` skips waiting for activation; the default is five seconds. Agents can
-pass `--expect-revision` to reject a set based on stale state. To roll back, take
-`revision` from `key status --json`, then run:
+You can still edit `keys.env` by hand. It's shell-sourceable and uses the vendor's
+own variable names:
 
 ```zsh
-turnpike key rollback deepseek --expect-revision "$revision" --json
-```
-
-Rollback swaps the two slots. Repeating it with the old revision fails instead
-of swapping them back. CLI writers serialize updates; manual editors should use
-atomic saves. A malformed save keeps the loaded keys, but a syntactically valid
-partial file can remove entries. Prefer `set-key` for routine updates.
-
-Provider issuance, authentication checks, inference checks, and revocation belong
-to the external helper or agent. Create and verify the candidate before installing
-it. After activation, verify a small inference call before revoking the old key.
-Local reports leave `upstream_verification` and `old_key_revocation` as
-`not_checked`; they do not establish that either external step succeeded.
-
-The file remains shell-sourceable and uses vendor variable names:
-
-```zsh
-# ~/.config/turnpike/keys.env — illustrative values only
+# ~/.config/turnpike/keys.env
 DEEPSEEK_API_KEY=sk-...
 DEEPSEEK_API_KEY_PREVIOUS=sk-...
 TURNPIKE_SENTINEL_DEFAULT=tp-...
 ```
 
-Comments occupy their own lines. Values use `[A-Za-z0-9._+/=-]`, optionally quoted.
-Sentinels require `tp-` plus at least 16 characters. Unknown sentinels or missing
-provider keys produce a local 401. The file must be regular, not a symlink.
+Comments go on their own line. A `#` after a value is a parse error, because a
+shell would read it differently from turnpike. A sentinel is `tp-` and at least 16
+more characters; add `TURNPIKE_SENTINEL_<NAME>` lines if you want one per tool, so
+you can revoke one alone. Save atomically, as most editors do: a broken save keeps
+the last good keys, but a valid file that's missing a line drops that key.
 
-If turnpike is down, restore the real key and point the client at the upstream:
+If turnpike is down, a tool holding a sentinel can't reach the provider directly.
+Load the real key from the file and unset the base URL:
 
 ```zsh
 export DEEPSEEK_API_KEY="$(. ~/.config/turnpike/keys.env; print -r -- "$DEEPSEEK_API_KEY")"
@@ -521,8 +504,8 @@ laptop spent $40 last Tuesday, that's this.
 ## Boundaries
 
 - A meter, not a gateway. It doesn't route, balance, cache, retry, or hold budgets.
-  It holds your keys only if you write a `keys.env`, and then it only swaps them
-  into the auth header.
+  It holds your keys only if you give it some (`set-key` or `keys.env`), and then
+  it only swaps them into the auth header.
 - Local only. Listeners bind loopback (`127.0.0.1` and `::1`), never `0.0.0.0`;
   nothing is network-exposed.
 - Usage metadata only. No prompt or response bodies, ever.
