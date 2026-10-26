@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
 
 fn private_dir(path: &Path) -> Result<()> {
     fs::DirBuilder::new()
@@ -213,8 +214,7 @@ async fn input(from_stdin: bool) -> Result<String> {
         }
         // Ctrl-C's default action would exit past EchoGuard and leave the
         // terminal silent, so take SIGINT before echo goes off.
-        let mut interrupt =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
         let original = rustix::termios::tcgetattr(&stdin)?;
         let mut hidden = original.clone();
         hidden.local_modes.remove(rustix::termios::LocalModes::ECHO);
@@ -294,6 +294,10 @@ async fn execute(cmd: KeysCmd, path: &Path, socket: &Path) -> Result<Report> {
     } else {
         None
     };
+    // Taken only after the key is read, so a pipeline killed mid-write can't
+    // leave a truncated key to save. From here Ctrl-C only ends the
+    // activation wait early; the save has landed whole or not at all.
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let _guard = if provider.is_some() {
         private_dir(path.parent().context("key file needs a directory")?)?;
         Some(lock(&path.with_extension("lock"))?)
@@ -367,7 +371,10 @@ async fn execute(cmd: KeysCmd, path: &Path, socket: &Path) -> Result<Report> {
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = interrupt.recv() => break,
+        }
     }
     let activation = if file_error.is_none()
         && revision.is_some()
