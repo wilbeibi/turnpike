@@ -575,11 +575,10 @@ impl PriceTable {
         // covers both, both are a breakdown of it; otherwise the write is
         // additive and billed only at the write rate.
         let non_cached_input = if prices.cache_in_input {
-            if input >= cache_read + cache_creation {
-                (input - cache_read - cache_creation) as f64
-            } else {
-                input.saturating_sub(cache_read) as f64
-            }
+            input
+                .checked_sub(cache_read)
+                .and_then(|rest| rest.checked_sub(cache_creation))
+                .unwrap_or_else(|| input.saturating_sub(cache_read)) as f64
         } else {
             input as f64
         };
