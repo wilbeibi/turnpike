@@ -1,6 +1,7 @@
+use crate::custody::Custody;
 use crate::json_usage::JsonUsageExtractor;
 use crate::parsers::{model_from_request_body, model_from_response_value, raw_usage_value};
-use crate::paths::calls_db;
+use crate::paths::{calls_db, keys_env};
 use crate::peer::resolve_peer_exe;
 use crate::providers::{MergeSse, ParseJson, Provider, PROVIDERS};
 use crate::record::{classify_error, Record, Store, Usage};
@@ -8,7 +9,7 @@ use crate::sse::SseSplitter;
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri};
 use axum::response::Response;
 use axum::Router;
 use bytes::Bytes;
@@ -29,6 +30,9 @@ struct ProxyState {
     provider: &'static Provider,
     client: Client,
     store: Arc<Mutex<Store>>,
+    custody: Arc<Custody>,
+    /// Test seam: send every provider here instead of its `upstream_url`.
+    upstream_override: Option<String>,
 }
 
 const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
@@ -104,6 +108,11 @@ pub async fn run_all() -> Result<()> {
     }
     let client = Client::builder().use_rustls_tls().build()?;
     let store = Arc::new(Mutex::new(Store::open(&calls_db())?));
+    let custody = Arc::new(Custody::open(keys_env()));
+    custody.clone().spawn_watch();
+    if let Err(e) = crate::keys::serve_status(custody.clone(), &crate::paths::keys_socket()) {
+        warn!("turnpike: credential status unavailable: {e:#}");
+    }
 
     let mut handles = Vec::new();
 
@@ -112,11 +121,11 @@ pub async fn run_all() -> Result<()> {
             provider,
             client: client.clone(),
             store: store.clone(),
+            custody: custody.clone(),
+            upstream_override: None,
         };
 
-        let app = Router::new()
-            .fallback(handle_request)
-            .with_state(Arc::new(state));
+        let app = router(state);
 
         // Bind both loopback stacks. `<provider>.localhost` resolves to ::1
         // before 127.0.0.1 on most systems, so an IPv4-only listener silently
@@ -154,6 +163,12 @@ pub async fn run_all() -> Result<()> {
     Ok(())
 }
 
+fn router(state: ProxyState) -> Router {
+    Router::new()
+        .fallback(handle_request)
+        .with_state(Arc::new(state))
+}
+
 fn spawn_serve(listener: TcpListener, app: Router) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // ConnectInfo carries the peer SocketAddr into handle_request so the
@@ -181,7 +196,7 @@ async fn handle_request(
     let method = parts.method;
     let uri = parts.uri;
     let path = uri.path();
-    let headers = parts.headers;
+    let mut headers = parts.headers;
 
     // `<provider>.localhost` in the Host header routes by name from any turnpike
     // port; a plain host keeps the port's provider.
@@ -193,6 +208,16 @@ async fn handle_request(
             return Err(StatusCode::MISDIRECTED_REQUEST);
         }
     };
+
+    // Credential custody (invariant 1b): a sentinel becomes this provider's
+    // key; any other credential is forwarded as sent. The map is snapshotted
+    // once, so a reload mid-request cannot change this request's key.
+    if let Err(refusal) =
+        crate::custody::apply(&mut headers, provider, state.custody.snapshot().as_deref())
+    {
+        warn!("turnpike [{}]: {}", provider.name, refusal.message());
+        return Ok(refusal.response());
+    }
 
     // Model from path (Gemini) or from body.
     let model_from_path = (provider.model_from_path)(path);
@@ -229,7 +254,17 @@ async fn handle_request(
     let model = model_from_path.or(model_from_body);
 
     // Build upstream URL.
-    let upstream = format!("{}{}", provider.upstream_url, uri);
+    let base = state
+        .upstream_override
+        .as_deref()
+        .unwrap_or(provider.upstream_url);
+    let Some(upstream) = upstream_url(base, &uri) else {
+        warn!(
+            "turnpike [{}]: request target has no path; refusing to forward",
+            provider.name
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    };
 
     let mut upstream_req = state
         .client
@@ -759,6 +794,14 @@ fn provider_from_host(headers: &HeaderMap, authority: Option<&str>) -> HostRoute
     }
 }
 
+/// The upstream URL is the provider's base plus the client's path and query,
+/// never the client's scheme or authority: an absolute- or authority-form
+/// request target must not pick the host that receives a custody key.
+fn upstream_url(base: &str, uri: &Uri) -> Option<String> {
+    let pq = uri.path_and_query()?.as_str();
+    pq.starts_with('/').then(|| format!("{base}{pq}"))
+}
+
 /// Client identity for per-tool attribution: `x-turnpike-client` when the
 /// caller sets one, else the request `User-Agent`. Returns the value plus
 /// its provenance — "header" (declared) or "ua" (fallback) — because
@@ -1017,6 +1060,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_target_cannot_choose_the_upstream_host() {
+        let base = "https://api.deepseek.com";
+        let at = |t: &str| upstream_url(base, &t.parse().unwrap());
+        assert_eq!(
+            at("/v1/chat/completions?x=1").as_deref(),
+            Some("https://api.deepseek.com/v1/chat/completions?x=1")
+        );
+        for absolute in [
+            "x.attacker.example://foo/v1/chat/completions",
+            "https://attacker.example/v1/chat/completions",
+        ] {
+            assert_eq!(
+                at(absolute).as_deref(),
+                Some("https://api.deepseek.com/v1/chat/completions"),
+                "{absolute}"
+            );
+        }
+        assert_eq!(at(".attacker.example:443"), None);
+        assert_eq!(at("*"), None);
+    }
+
     fn host_route(host: Option<&str>, authority: Option<&str>) -> HostRoute {
         let mut h = HeaderMap::new();
         if let Some(v) = host {
@@ -1165,5 +1230,238 @@ mod tests {
             ..Default::default()
         };
         assert!(!usage_is_empty(&with_tokens));
+    }
+}
+
+/// Custody through the real handler: a fake upstream on an ephemeral port
+/// reports the credential it received. Never binds turnpike's own ports.
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    use crate::custody::test_support::{write_keys, TempDir};
+    use crate::custody::{parse, Custody};
+    use tokio::sync::Notify;
+
+    const SENTINEL: &str = "tp-0123456789abcdef0123";
+
+    #[derive(Default)]
+    struct Upstream {
+        seen: Mutex<Vec<String>>,
+        release: Notify,
+    }
+
+    /// `/slow` streams one SSE event, waits for `release`, then finishes;
+    /// anything else answers at once. Both record the Authorization header.
+    async fn fake_upstream(up: State<Arc<Upstream>>, req: Request<Body>) -> Response<Body> {
+        let auth = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        up.seen.lock().unwrap().push(auth);
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        tx.send(Ok(Bytes::from("data: {\"part\":1}\n\n")))
+            .await
+            .unwrap();
+        let up = up.0.clone();
+        let slow = req.uri().path() == "/slow";
+        tokio::spawn(async move {
+            if slow {
+                up.release.notified().await;
+            }
+            let _ = tx.send(Ok(Bytes::from("data: {\"part\":2}\n\n"))).await;
+        });
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(tokio_stream(rx)))
+            .unwrap()
+    }
+
+    fn tokio_stream<T>(mut rx: mpsc::Receiver<T>) -> impl Stream<Item = T> {
+        stream::poll_fn(move |cx| rx.poll_recv(cx))
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// (proxy base URL, upstream) for the deepseek port with `custody`.
+    async fn setup(custody: Arc<Custody>) -> (String, Arc<Upstream>) {
+        let up = Arc::new(Upstream::default());
+        let upstream_url =
+            serve(Router::new().fallback(fake_upstream).with_state(up.clone())).await;
+        let state = ProxyState {
+            provider: PROVIDERS.iter().find(|p| p.name == "deepseek").unwrap(),
+            client: Client::new(),
+            store: Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+            custody,
+            upstream_override: Some(upstream_url),
+        };
+        (serve(router(state)).await, up)
+    }
+
+    fn keys(key: &str) -> String {
+        format!("DEEPSEEK_API_KEY={key}\nTURNPIKE_SENTINEL_TEST={SENTINEL}\n")
+    }
+
+    async fn call(client: &Client, url: &str, token: &str) -> reqwest::Response {
+        client
+            .post(url)
+            .bearer_auth(token)
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reload_mid_stream_keeps_that_streams_key() {
+        let dir = TempDir::new("proxy-reload");
+        let path = dir.0.join("keys.env");
+        write_keys(&path, &keys("sk-old"), 0o600);
+        let custody = Arc::new(Custody::open(path.clone()));
+        let (proxy, up) = setup(custody.clone()).await;
+        let client = Client::new();
+
+        let slow = call(&client, &format!("{proxy}/slow"), SENTINEL).await;
+        assert_eq!(slow.status(), 200);
+        let mut body = slow.bytes_stream();
+        let first = body.next().await.unwrap().unwrap();
+        assert!(first.starts_with(b"data: {\"part\":1}"));
+
+        // Rotate while the stream is open, then prove the new key is live.
+        write_keys(&path, &keys("sk-new"), 0o600);
+        custody.reload().unwrap();
+        let fast = call(&client, &format!("{proxy}/fast"), SENTINEL).await;
+        assert_eq!(fast.status(), 200);
+        fast.bytes().await.unwrap();
+
+        // A malformed save now changes nothing either.
+        write_keys(&path, "DEEPSEEK_API_KEY=sk-broken\nGARBAGE\n", 0o600);
+        assert!(custody.reload().is_err());
+
+        up.release.notify_one();
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend_from_slice(&chunk.unwrap());
+        }
+        assert!(rest.starts_with(b"data: {\"part\":2}"));
+
+        let after = call(&client, &format!("{proxy}/fast"), SENTINEL).await;
+        after.bytes().await.unwrap();
+        assert_eq!(
+            *up.seen.lock().unwrap(),
+            ["Bearer sk-old", "Bearer sk-new", "Bearer sk-new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_sentinel_is_refused_before_the_upstream() {
+        let map = parse(&keys("sk-fake")).unwrap();
+        let (proxy, up) = setup(Arc::new(Custody::with_map(Some(map)))).await;
+        let resp = call(&Client::new(), &proxy, "tp-ffffffffffffffffffff").await;
+        assert_eq!(resp.status(), 401);
+        let body: Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "turnpike");
+        assert!(!body.to_string().contains("tp-ffff"));
+        assert!(up.seen.lock().unwrap().is_empty());
+    }
+
+    /// Live check, run by hand: `cargo test live_deepseek -- --ignored`.
+    /// The key comes from `$DEEPSEEK_API_KEY` into memory only — no file —
+    /// and goes through the running turnpike on :4003 so the calls are
+    /// metered. Only status codes are ever printed: a provider's 401 body
+    /// can echo part of the key.
+    #[tokio::test]
+    #[ignore]
+    async fn live_deepseek_through_a_sentinel() {
+        let key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY");
+        assert!(
+            !key.starts_with("tp-"),
+            "the environment already holds a sentinel"
+        );
+        let upstream =
+            std::env::var("TURNPIKE_LIVE_UPSTREAM").unwrap_or("http://127.0.0.1:4003".into());
+        let chat = |client: &Client, proxy: &str, token: &str| {
+            client
+                .post(format!("{proxy}/v1/chat/completions"))
+                .bearer_auth(token)
+                .header("x-turnpike-client", "turnpike-test:custody-live")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(
+                    r#"{"model":"deepseek-chat","stream":true,"max_tokens":8,
+                        "messages":[{"role":"user","content":"Reply with: ok"}]}"#,
+                )
+                .send()
+        };
+        let live = |map: String| {
+            let upstream = upstream.clone();
+            async move {
+                let state = ProxyState {
+                    provider: PROVIDERS.iter().find(|p| p.name == "deepseek").unwrap(),
+                    client: Client::new(),
+                    store: Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+                    custody: Arc::new(Custody::with_map(Some(parse(&map).unwrap()))),
+                    upstream_override: Some(upstream),
+                };
+                serve(router(state)).await
+            }
+        };
+        let client = Client::new();
+
+        // The sentinel is swapped for the real key; the stream carries usage.
+        let proxy = live(format!(
+            "DEEPSEEK_API_KEY={key}\nTURNPIKE_SENTINEL_TEST={SENTINEL}\n"
+        ))
+        .await;
+        let resp = chat(&client, &proxy, SENTINEL).await.unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await.unwrap();
+        assert!(status == 200, "sentinel call: HTTP {status}");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("\"usage\""), "no usage event in the stream");
+        assert!(text.contains("[DONE]"), "stream did not finish");
+
+        // A bad current key fails loudly; the good _PREVIOUS is never tried.
+        let proxy = live(format!(
+            "DEEPSEEK_API_KEY=sk-00000000000000000000000000000000\n\
+             DEEPSEEK_API_KEY_PREVIOUS={key}\nTURNPIKE_SENTINEL_TEST={SENTINEL}\n"
+        ))
+        .await;
+        let status = chat(&client, &proxy, SENTINEL)
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert!(status == 401, "bad key: HTTP {status}, want 401");
+
+        // An unknown sentinel never leaves the machine.
+        let status = chat(&client, &proxy, "tp-ffffffffffffffffffff")
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert!(status == 401, "unknown sentinel: HTTP {status}");
+    }
+
+    #[tokio::test]
+    async fn a_real_key_passes_through_with_or_without_custody() {
+        for map in [Some(parse(&keys("sk-fake")).unwrap()), None] {
+            let (proxy, up) = setup(Arc::new(Custody::with_map(map))).await;
+            let resp = call(&Client::new(), &proxy, "sk-client-own").await;
+            assert_eq!(resp.status(), 200);
+            resp.bytes().await.unwrap();
+            assert_eq!(*up.seen.lock().unwrap(), ["Bearer sk-client-own"]);
+        }
     }
 }

@@ -258,7 +258,7 @@ pub fn classify_error(message: &str) -> &'static str {
 
 #[cfg(test)]
 impl Store {
-    fn open_in_memory() -> Result<Self> {
+    pub(crate) fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let store = Self { conn };
         store.init()?;

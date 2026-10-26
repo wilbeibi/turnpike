@@ -126,6 +126,21 @@ fn classify(direct: usize, hits: usize, flagged: usize, incomplete: bool) -> Out
     }
 }
 
+/// The key the proxy would send for `provider`: keys.env's, else a real
+/// key from the environment. A sentinel is never a key.
+fn bill_key<'a>(
+    provider: &Provider,
+    env: &'a HashMap<String, String>,
+    custody: Option<&'a crate::custody::KeyMap>,
+) -> Option<&'a str> {
+    custody.and_then(|m| m.key(provider.name)).or_else(|| {
+        key_var(provider, env)
+            .and_then(|v| env.get(v))
+            .map(String::as_str)
+            .filter(|k| !k.starts_with(crate::custody::SENTINEL_PREFIX))
+    })
+}
+
 struct BillRow {
     provider: &'static str,
     status: Status,
@@ -149,6 +164,20 @@ async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Bills
     let mut state = bill::State::load(&state_path)?;
     let client = reqwest::Client::builder().timeout(bill::TIMEOUT).build()?;
     let now = Timestamp::now().to_string();
+    // Under custody the environment holds sentinels and the keys live in
+    // keys.env. A missing file means no custody here; a broken one is said
+    // out loud. The daemon may retain an older map; `key status` reports it.
+    let keys_env = crate::paths::keys_env();
+    let custody = match crate::custody::load(&keys_env) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            if keys_env.exists() {
+                eprintln!("warning: keys.env not loaded: {e:#}");
+            }
+            None
+        }
+    };
+    let custody = custody.as_ref();
 
     // All sources at once: a black-holed network costs one timeout, not one
     // per source.
@@ -159,7 +188,7 @@ async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Bills
                 .iter()
                 .find(|p| p.name == src.provider)
                 .expect("bill sources name known providers");
-            let key = key_var(provider, env).and_then(|v| env.get(v));
+            let key = bill_key(provider, env, custody);
             match (offline, key) {
                 (true, _) => Err(Status::Offline),
                 (false, None) => Err(Status::NoKey),
@@ -599,6 +628,21 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn bill_key_prefers_custody_and_never_uses_a_sentinel() {
+        let ds = PROVIDERS.iter().find(|p| p.name == "deepseek").unwrap();
+        let sentinel = env(&[("DEEPSEEK_API_KEY", "tp-0123456789abcdef0123")]);
+        let real = env(&[("DEEPSEEK_API_KEY", "sk-env")]);
+        let keys = crate::custody::parse(
+            "DEEPSEEK_API_KEY=sk-custody\nTURNPIKE_SENTINEL_A=tp-0123456789abcdef0123\n",
+        )
+        .unwrap();
+        assert_eq!(bill_key(ds, &sentinel, None), None);
+        assert_eq!(bill_key(ds, &sentinel, Some(&keys)), Some("sk-custody"));
+        assert_eq!(bill_key(ds, &real, None), Some("sk-env"));
+        assert_eq!(bill_key(ds, &real, Some(&keys)), Some("sk-custody"));
     }
 
     #[test]
