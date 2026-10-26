@@ -1,5 +1,5 @@
 use crate::providers::PROVIDERS;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "turnpike", version, about = "Personal LLM API usage meter")]
@@ -124,6 +124,25 @@ pub enum Command {
         format: Option<Format>,
     },
 
+    /// Install a provider key. Exit 0 loaded, 2 error, 3 activation unconfirmed.
+    SetKey {
+        #[command(flatten)]
+        args: KeySetArgs,
+        /// Emit secret-free JSON, including operational errors.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update local credentials. Exit 0 loaded, 2 error, 3 activation unconfirmed.
+    #[command(name = "key", alias = "keys")]
+    Keys {
+        /// Emit secret-free JSON, including operational errors.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+
     /// Manage the local pricing table.
     Prices {
         #[command(subcommand)]
@@ -158,4 +177,38 @@ pub enum Format {
 /// error on a wrong one are generated from the same list the proxy routes by.
 fn provider_names() -> clap::builder::PossibleValuesParser {
     clap::builder::PossibleValuesParser::new(PROVIDERS.iter().map(|p| p.name))
+}
+
+#[derive(Subcommand)]
+pub enum KeysCmd {
+    /// Compare the key file with the running daemon. Never print credentials.
+    Status,
+    /// Install a key atomically and retain the old key for rollback.
+    Set(KeySetArgs),
+    /// Swap current and previous keys against an explicitly expected revision.
+    Rollback {
+        #[arg(value_parser = provider_names())]
+        provider: String,
+        /// Revision from key status. Prevents repeating an already completed rollback.
+        #[arg(long)]
+        expect_revision: String,
+        /// Seconds to wait for daemon activation.
+        #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(0..=60))]
+        wait: u64,
+    },
+}
+
+#[derive(Args)]
+pub struct KeySetArgs {
+    #[arg(value_parser = provider_names())]
+    pub provider: String,
+    /// Read the key from a pipe. Otherwise use a hidden terminal prompt.
+    #[arg(long)]
+    pub stdin: bool,
+    /// Refuse changes if the file revision differs from this value.
+    #[arg(long)]
+    pub expect_revision: Option<String>,
+    /// Seconds to wait for daemon activation. Zero saves without waiting.
+    #[arg(long, default_value = "5", value_parser = clap::value_parser!(u64).range(0..=60))]
+    pub wait: u64,
 }

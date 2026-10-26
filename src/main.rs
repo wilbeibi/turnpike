@@ -6,6 +6,7 @@ mod cost;
 mod custody;
 mod doctor;
 mod json_usage;
+mod keys;
 mod parsers;
 mod paths;
 mod peer;
@@ -107,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
                 cli::Format::Json => config::ConfigFormat::Json,
             }),
         })?,
+        Command::SetKey { args, json } => {
+            std::process::exit(keys::run(cli::KeysCmd::Set(args), json).await)
+        }
+        Command::Keys { cmd, json } => std::process::exit(keys::run(cmd, json).await),
         Command::Prices { cmd } => match cmd {
             cli::PricesCmd::Pull => pricing::pull(&paths::prices_json()).await?,
             cli::PricesCmd::Show => pricing::show(&paths::prices_json(), &paths::calls_db()),

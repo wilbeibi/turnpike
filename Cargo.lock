@@ -1654,6 +1654,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

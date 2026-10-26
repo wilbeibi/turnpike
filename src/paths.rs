@@ -22,7 +22,7 @@ pub fn doctor_json() -> PathBuf {
     data_dir().join("doctor.json")
 }
 
-/// Config, not data: the user writes these, turnpike only reads them.
+/// Provider keys and local control files.
 pub fn config_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_CONFIG_HOME") {
         if !d.is_empty() {
@@ -41,4 +41,8 @@ fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn keys_socket() -> PathBuf {
+    config_dir().join("keys.sock")
 }

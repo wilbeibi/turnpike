@@ -110,6 +110,9 @@ pub async fn run_all() -> Result<()> {
     let store = Arc::new(Mutex::new(Store::open(&calls_db())?));
     let custody = Arc::new(Custody::open(keys_env()));
     custody.clone().spawn_watch();
+    if let Err(e) = crate::keys::serve_status(custody.clone(), &crate::paths::keys_socket()) {
+        warn!("turnpike: credential status unavailable: {e:#}");
+    }
 
     let mut handles = Vec::new();
 

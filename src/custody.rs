@@ -14,6 +14,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -25,20 +26,26 @@ pub const SENTINEL_PREFIX: &str = "tp-";
 const MIN_SENTINEL_RANDOM: usize = 16;
 const SENTINEL_VAR_PREFIX: &str = "TURNPIKE_SENTINEL_";
 const PREVIOUS_SUFFIX: &str = "_PREVIOUS";
-const MAX_FILE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Headers a sentinel is looked for (and substituted) in. `authorization`
 /// keeps its scheme; the other two carry the bare credential.
 const CREDENTIAL_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct KeyMap {
     /// Provider name → the key that is sent. A `_PREVIOUS` key is validated
     /// and then dropped: it exists for the user to roll back to, and is
     /// never sent, so it is never held.
     keys: HashMap<&'static str, String>,
     sentinels: HashSet<String>,
+}
+
+impl std::fmt::Debug for KeyMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&summary(self))
+    }
 }
 
 impl KeyMap {
@@ -97,6 +104,12 @@ pub fn parse(text: &str) -> Result<KeyMap> {
             .strip_suffix(PREVIOUS_SUFFIX)
             .and_then(provider_for_var)
         {
+            if value.starts_with(SENTINEL_PREFIX) {
+                bail!("keys.env line {n} ({name}): a key cannot be a sentinel");
+            }
+            if previous.iter().any(|(p, _)| *p == provider) {
+                bail!("keys.env line {n} ({name}): a second previous key for {provider}; keep one");
+            }
             previous.push((provider, n));
         } else if let Some(provider) = provider_for_var(name) {
             if value.starts_with(SENTINEL_PREFIX) {
@@ -121,20 +134,57 @@ pub fn parse(text: &str) -> Result<KeyMap> {
 /// Read, check, and parse the file. Group/other access is refused the way
 /// ssh refuses a readable private key.
 pub fn load(path: &Path) -> Result<KeyMap> {
-    let meta = std::fs::metadata(path).with_context(|| format!("{}", path.display()))?;
+    let (text, _) = read_file(path)?;
+    parse(&text)
+}
+
+/// The revision describes file metadata, never a hash or fragment of a secret.
+pub(crate) fn revision(m: &std::fs::Metadata) -> String {
+    format!(
+        "{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}",
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec()
+    )
+}
+
+pub(crate) fn read_file(path: &Path) -> Result<(String, String)> {
+    // NONBLOCK makes a mistakenly configured FIFO fail instead of blocking
+    // the proxy's single runtime thread. NOFOLLOW refuses secret-file symlinks.
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("keys.env must be a regular file");
+    }
     let mode = meta.mode() & 0o777;
     if mode & 0o077 != 0 {
-        bail!(
-            "{} is mode {mode:03o}; it holds keys — chmod 600 {}",
-            path.display(),
-            path.display()
-        );
+        bail!("keys.env is mode {mode:03o}; run chmod 600 on the key file");
     }
-    if meta.len() > MAX_FILE_BYTES {
-        bail!("{} is over {MAX_FILE_BYTES} bytes", path.display());
+    let mut text = String::new();
+    (&file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .context("reading keys.env")?;
+    if text.len() as u64 > MAX_FILE_BYTES {
+        bail!("keys.env is over {MAX_FILE_BYTES} bytes");
     }
-    let text = std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
-    parse(&text)
+    let rev = revision(&meta);
+    if revision(&file.metadata()?) != rev {
+        bail!("keys.env changed while reading; save it atomically and retry");
+    }
+    Ok((text, rev))
 }
 
 fn is_var_name(s: &str) -> bool {
@@ -147,7 +197,7 @@ fn is_var_name(s: &str) -> bool {
 
 /// A bare, `'single'`, or `"double"` quoted value from a charset the shell
 /// reads literally — no expansion, no escapes — so turnpike and `.` agree.
-fn unquote(v: &str) -> Option<&str> {
+pub(crate) fn unquote(v: &str) -> Option<&str> {
     let inner = match v.as_bytes() {
         [b'\'', .., b'\''] | [b'"', .., b'"'] if v.len() >= 2 => &v[1..v.len() - 1],
         _ => v,
@@ -159,7 +209,7 @@ fn unquote(v: &str) -> Option<&str> {
     ok.then_some(inner)
 }
 
-fn provider_for_var(name: &str) -> Option<&'static str> {
+pub(crate) fn provider_for_var(name: &str) -> Option<&'static str> {
     PROVIDERS
         .iter()
         .find(|p| p.key_envs.contains(&name))
@@ -259,22 +309,26 @@ fn split_credential<'a>(
 /// so a reload never changes the key of a request already on its way.
 pub struct Custody {
     path: PathBuf,
-    map: RwLock<Option<Arc<KeyMap>>>,
+    live: RwLock<Live>,
 }
 
-/// What changes when the file is edited, replaced, or chmod-ed.
-type Fingerprint = (u64, u64, i64, i64, i64, i64);
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Status {
+    pub loaded_revision: Option<String>,
+    pub providers: Vec<String>,
+    pub sentinel_count: usize,
+    pub last_reload_error: Option<String>,
+}
 
+#[derive(Default)]
+struct Live {
+    map: Option<Arc<KeyMap>>,
+    status: Status,
+}
+
+type Fingerprint = String;
 fn fingerprint(path: &Path) -> Option<Fingerprint> {
-    let m = std::fs::metadata(path).ok()?;
-    Some((
-        m.ino(),
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec(),
-        m.ctime(),
-        m.ctime_nsec(),
-    ))
+    std::fs::metadata(path).ok().map(|m| revision(&m))
 }
 
 impl Custody {
@@ -282,44 +336,68 @@ impl Custody {
     /// logged and also leaves it off, so tools still holding real keys keep
     /// working and the next good save turns it on.
     pub fn open(path: PathBuf) -> Self {
-        let map = if path.exists() {
-            match load(&path) {
-                Ok(m) => {
-                    info!("turnpike: {}", summary(&m));
-                    Some(Arc::new(m))
-                }
-                Err(e) => {
-                    error!("turnpike: keys.env not loaded; sentinels will be refused: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        Self {
+        let c = Self {
             path,
-            map: RwLock::new(map),
+            live: RwLock::new(Live::default()),
+        };
+        if c.path.exists() {
+            if let Err(e) = c.reload() {
+                error!("turnpike: keys.env not loaded; sentinels will be refused: {e:#}");
+            }
         }
+        c
     }
 
     #[cfg(test)]
     pub fn with_map(map: Option<KeyMap>) -> Self {
         Self {
             path: PathBuf::new(),
-            map: RwLock::new(map.map(Arc::new)),
+            live: RwLock::new(Live {
+                map: map.map(Arc::new),
+                ..Live::default()
+            }),
         }
     }
 
     pub fn snapshot(&self) -> Option<Arc<KeyMap>> {
-        self.map.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.live
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .clone()
     }
 
-    /// Re-read the file. On any failure the previous map stays in force.
+    pub(crate) fn status(&self) -> Status {
+        self.live
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .clone()
+    }
+
+    /// Publish the map and its revision together; failed reads retain both.
     pub fn reload(&self) -> Result<()> {
-        let m = load(&self.path)?;
-        info!("turnpike: reloaded {}", summary(&m));
-        *self.map.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(m));
-        Ok(())
+        let result = read_file(&self.path).and_then(|(text, rev)| Ok((parse(&text)?, rev)));
+        let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok((map, rev)) => {
+                info!("turnpike: reloaded {}", summary(&map));
+                let mut providers: Vec<_> = map.keys.keys().map(|p| p.to_string()).collect();
+                providers.sort();
+                live.status = Status {
+                    loaded_revision: Some(rev),
+                    providers,
+                    sentinel_count: map.sentinels.len(),
+                    last_reload_error: None,
+                };
+                live.map = Some(Arc::new(map));
+                Ok(())
+            }
+            Err(e) => {
+                live.status.last_reload_error = Some(format!("{e:#}"));
+                Err(e)
+            }
+        }
     }
 
     /// One watch tick: reload if the file changed since `last`.
@@ -329,7 +407,12 @@ impl Custody {
             return;
         }
         *last = now;
-        if now.is_none() {
+        if last.is_none() {
+            self.live
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .status
+                .last_reload_error = Some("keys.env is missing; keeping the loaded map".into());
             warn!("turnpike: keys.env is gone; keeping the keys already loaded");
             return;
         }
@@ -341,7 +424,7 @@ impl Custody {
     /// Poll the file's metadata every couple of seconds. Saving the file is
     /// the whole reload procedure — no signal, no unit change, no restart.
     pub fn spawn_watch(self: Arc<Self>) {
-        let mut last = fingerprint(&self.path);
+        let mut last = None;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(POLL_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

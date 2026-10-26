@@ -166,7 +166,7 @@ async fn bill_rows(env: &HashMap<String, String>, offline: bool) -> Result<Bills
     let now = Timestamp::now().to_string();
     // Under custody the environment holds sentinels and the keys live in
     // keys.env. A missing file means no custody here; a broken one is said
-    // out loud, since the proxy is refusing sentinels for the same reason.
+    // out loud. The daemon may retain an older map; `key status` reports it.
     let keys_env = crate::paths::keys_env();
     let custody = match crate::custody::load(&keys_env) {
         Ok(m) => Some(m),
