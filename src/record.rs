@@ -271,6 +271,20 @@ impl Store {
             .unwrap_or(0)
     }
 
+    /// Every row, oldest first.
+    pub(crate) fn all(&self) -> Vec<Record> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id FROM calls ORDER BY rowid")
+            .unwrap();
+        let ids: Vec<String> = st
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        ids.iter().filter_map(|id| self.get_by_id(id)).collect()
+    }
+
     fn get_by_id(&self, id: &str) -> Option<Record> {
         self.conn
             .query_row(

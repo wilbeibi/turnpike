@@ -41,6 +41,9 @@ const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
 /// the request body itself — far past the old 64 KiB chat-delta ceiling.
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_CLIENT_BYTES: usize = 128;
+/// Cap on the stored `error_message`: a transport error's cause chain or an
+/// upstream's `error.message`.
+const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 /// Cap on verbatim usage sub-objects retained for the `raw_usage` audit
 /// column. Providers send one (OpenAI/Gemini) or two (Anthropic
 /// `message_start` + `message_delta`); the cap only guards against a
@@ -291,7 +294,7 @@ async fn handle_request(
         Ok(r) => r,
         Err(e) => {
             let message = sanitized_reqwest_error(&e);
-            let kind = classify_error(&message);
+            let kind = classify_reqwest_error(&e, &message);
             if is_inference_endpoint(&endpoint) {
                 let rec = Record {
                     id: call_id,
@@ -387,7 +390,7 @@ async fn handle_request(
                 Ok(c) => c,
                 Err(e) => {
                     let message = sanitized_reqwest_error(&e);
-                    let kind = classify_error(&message).to_string();
+                    let kind = classify_reqwest_error(&e, &message).to_string();
                     let _ = body_tx
                         .send(Err(std::io::Error::other(message.clone())))
                         .await;
@@ -938,7 +941,73 @@ fn is_hop_by_hop_header(name: &HeaderName, connection_tokens: &[String]) -> bool
 }
 
 fn sanitized_reqwest_error(err: &reqwest::Error) -> String {
-    sanitize_error_message(&err.to_string(), err.url())
+    let message = sanitize_error_message(&error_chain(err), err.url());
+    truncate_to(message, MAX_ERROR_MESSAGE_BYTES)
+}
+
+/// `error_kind` for a reqwest failure, from reqwest's own flags rather than
+/// the text: with the cause chain appended, substrings mislead ("connection
+/// reset" from the upstream is not a client disconnect; "connection" contains
+/// "connect"). Text matching is kept only to split TLS from other connect
+/// failures.
+fn classify_reqwest_error(err: &reqwest::Error, message: &str) -> &'static str {
+    if err.is_timeout() {
+        return "upstream_timeout";
+    }
+    if err.is_connect() {
+        return match classify_error(message) {
+            kind @ ("upstream_tls" | "upstream_timeout") => kind,
+            _ => "upstream_connect",
+        };
+    }
+    if from_client_body(err) {
+        return "client_disconnect";
+    }
+    "other"
+}
+
+/// The forwarded request body is the client's own stream, so an `axum::Error`
+/// in the chain means the client's upload stopped, not the upstream.
+fn from_client_body(err: &reqwest::Error) -> bool {
+    let mut next = std::error::Error::source(err);
+    while let Some(e) = next {
+        if e.is::<axum::Error>() {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+/// `err` and every `source()` beneath it, joined with ": ". reqwest's own
+/// text is only "error sending request for url (..)"; whether that was a
+/// refused connect, a TLS failure, a reset, or a body that stopped mid-stream
+/// is in the chain. A link whose text an outer link already printed is
+/// skipped.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut next = err.source();
+    while let Some(e) = next {
+        let text = e.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        next = e.source();
+    }
+    out
+}
+
+/// Cut `s` to at most `max` bytes without splitting a char.
+fn truncate_to(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 fn sanitize_error_message(message: &str, url: Option<&reqwest::Url>) -> String {
@@ -1199,6 +1268,49 @@ mod tests {
             sanitized,
             "error sending request for url (https://api.example.com/v1/messages)"
         );
+    }
+
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_appends_sources_and_skips_repeats() {
+        // reqwest -> hyper-util -> its Connect kind -> the io error.
+        let link = |text, source| Some(Box::new(Link(text, source)));
+        let err = Link(
+            "error sending request for url (http://127.0.0.1:9/v1)",
+            link(
+                "client error (Connect)",
+                link(
+                    "Connect",
+                    link("tcp connect error: Connection refused", None),
+                ),
+            ),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (http://127.0.0.1:9/v1): \
+             client error (Connect): tcp connect error: Connection refused"
+        );
+    }
+
+    #[test]
+    fn truncate_to_keeps_whole_chars() {
+        assert_eq!(truncate_to("ab€".into(), 3), "ab");
+        assert_eq!(truncate_to("ab€".into(), 5), "ab€");
+        assert_eq!(truncate_to("abc".into(), 512), "abc");
     }
 
     #[test]
@@ -1463,5 +1575,172 @@ mod custody_tests {
             resp.bytes().await.unwrap();
             assert_eq!(*up.seen.lock().unwrap(), ["Bearer sk-client-own"]);
         }
+    }
+}
+
+/// What a failed call leaves in `calls`, through the real handler against
+/// raw-TCP upstreams that misbehave on purpose.
+#[cfg(test)]
+mod error_record_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// (proxy base URL, its store) for the openrouter port aimed at `upstream`.
+    async fn proxy_to(upstream: String) -> (String, Arc<Mutex<Store>>) {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let state = ProxyState {
+            provider: PROVIDERS.iter().find(|p| p.name == "openrouter").unwrap(),
+            client: Client::new(),
+            store: store.clone(),
+            custody: Arc::new(Custody::with_map(None)),
+            upstream_override: Some(upstream),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{addr}"), store)
+    }
+
+    /// An HTTP/1.1 upstream that reads one request, writes `reply` verbatim,
+    /// and closes.
+    async fn raw_upstream(reply: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            read_request(&mut s).await;
+            s.write_all(&reply).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn read_request(s: &mut TcpStream) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = s.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                if buf.len() >= end + 4 + len {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn reply(status: &str, content_length: usize, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+             content-length: {content_length}\r\nconnection: close\r\n\r\n{body}"
+        )
+        .into_bytes()
+    }
+
+    async fn chat(proxy: &str, body: impl Into<reqwest::Body>) -> reqwest::Response {
+        Client::new()
+            .post(format!("{proxy}/api/v1/chat/completions?key=sk-secret"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The one row the call left. Rows are written off the request path, so
+    /// wait for it.
+    async fn only_row(store: &Mutex<Store>) -> Record {
+        for _ in 0..300 {
+            let mut rows = store.lock().unwrap().all();
+            if !rows.is_empty() {
+                assert_eq!(rows.len(), 1);
+                return rows.remove(0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no row written");
+    }
+
+    const SMALL: &str = r#"{"model":"m/x","messages":[]}"#;
+
+    #[tokio::test]
+    async fn a_refused_connect_keeps_its_cause() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (proxy, store) = proxy_to(upstream).await;
+
+        assert_eq!(chat(&proxy, SMALL).await.status(), 502);
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("upstream_connect"));
+        let msg = row.error_message.unwrap();
+        assert!(msg.contains("Connection refused"), "{msg}");
+        assert!(!msg.contains("sk-secret"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_is_other_not_connect() {
+        // "connection" contains "connect": text matching called this a
+        // connect failure.
+        let upstream = raw_upstream(reply("200 OK", 1000, r#"{"id""#)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let resp = chat(&proxy, SMALL).await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.is_err());
+        let row = only_row(&store).await;
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.error_kind.as_deref(), Some("other"));
+        let msg = row.error_message.unwrap();
+        assert!(
+            msg.contains("end of file before message length reached"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_mid_upload_is_client_disconnect() {
+        // The upstream reads and never answers; the client sends 64 KiB of a
+        // declared 2 MiB (the streamed path) and hangs up.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 65536];
+            while s.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let mut client = TcpStream::connect(proxy.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /api/v1/chat/completions HTTP/1.1\r\nhost: x\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            2 * 1024 * 1024
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.write_all(&[b' '; 65536]).await.unwrap();
+        drop(client);
+
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("client_disconnect"));
     }
 }
