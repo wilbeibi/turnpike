@@ -11,6 +11,7 @@ const MAX_MODEL_BYTES: usize = 256;
 /// stores at most the small matched usage object.
 pub struct JsonUsageExtractor {
     target_key: &'static str,
+    watch_usage: bool,
     depth: usize,
     in_string: bool,
     escape: bool,
@@ -38,6 +39,7 @@ impl JsonUsageExtractor {
     pub fn new(target_key: &'static str) -> Self {
         Self {
             target_key,
+            watch_usage: true,
             depth: 0,
             in_string: false,
             escape: false,
@@ -59,6 +61,16 @@ impl JsonUsageExtractor {
             collect_buf: Vec::new(),
             extracted: None,
             disabled: false,
+        }
+    }
+
+    /// Watches only the root `model`: for a request body, which has no usage
+    /// object and may be too large to buffer. Memory stays at the key and
+    /// model caps however large the body is.
+    pub fn model_only() -> Self {
+        Self {
+            watch_usage: false,
+            ..Self::new("")
         }
     }
 
@@ -122,7 +134,9 @@ impl JsonUsageExtractor {
             }
             b':' if self.depth == 1 => {
                 match self.last_top_string.as_deref() {
-                    Some(key) if key == self.target_key => self.expecting_value = true,
+                    Some(key) if self.watch_usage && key == self.target_key => {
+                        self.expecting_value = true
+                    }
                     Some("model" | "modelVersion") if self.model.is_none() => {
                         self.expecting_model_value = true;
                     }
@@ -334,6 +348,22 @@ mod tests {
             br#"{"choices":[{"message":{"content":"{\"model\":\"fake\"}","model":"nested"}}],"usage":{"prompt_tokens":10}}"#,
         );
         assert_eq!(ex.model(), None);
+    }
+
+    #[test]
+    fn model_only_finds_a_root_model_after_a_large_nested_string() {
+        // Request-shaped: an image data URL in messages, then the model.
+        let mut ex = JsonUsageExtractor::model_only();
+        ex.push(
+            br#"{"messages":[{"role":"user","model":"nested","content":"data:image/png;base64,"#,
+        );
+        for _ in 0..64 {
+            ex.push(&[b'A'; 32 * 1024]);
+        }
+        ex.push(br#""}],"usage":{"prompt_tokens":1},"model":"google/gemini-2.5-fl"#);
+        ex.push(br#"ash","stream":false}"#);
+        assert_eq!(ex.model(), Some("google/gemini-2.5-flash"));
+        assert!(ex.finish_wrapped().is_none());
     }
 
     #[test]

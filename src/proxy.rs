@@ -20,7 +20,7 @@ use reqwest::{Body as ReqwestBody, Client};
 use serde_json::Value;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -76,6 +76,9 @@ struct RecordBase {
     /// Peer socket address, carried to the write task so the caller's process
     /// can be resolved off the forward path (invariant 2).
     peer: SocketAddr,
+    /// The root `model` of a request body too large to buffer, set once the
+    /// scan has read past it.
+    request_model: Arc<OnceLock<String>>,
 }
 
 enum ObserveMsg {
@@ -239,6 +242,7 @@ async fn handle_request(
 
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
+    let request_model = Arc::new(OnceLock::new());
     let (model_from_body, upstream_body) = if needs_body_read {
         let body_bytes = axum::body::to_bytes(body, MAX_MODEL_INSPECT_BYTES)
             .await
@@ -254,6 +258,9 @@ async fn handle_request(
             body_bytes
         };
         (model, ReqwestBody::from(forwarded))
+    } else if model_from_path.is_none() {
+        let body = scan_for_model(body.into_data_stream(), request_model.clone());
+        (None, ReqwestBody::wrap_stream(body))
     } else {
         (None, ReqwestBody::wrap_stream(body.into_data_stream()))
     };
@@ -304,7 +311,8 @@ async fn handle_request(
                     id: call_id,
                     ts,
                     provider: provider.name.to_string(),
-                    model,
+                    // Known only if the failure came after the body's model.
+                    model: model.or_else(|| request_model.get().cloned()),
                     status: None,
                     latency_ms: t0.elapsed().as_millis() as u64,
                     ttft_ms: None,
@@ -353,7 +361,7 @@ async fn handle_request(
         id: call_id,
         ts,
         provider: provider.name.to_string(),
-        model,
+        model: model.or_else(|| request_model.get().cloned()),
         endpoint,
         status: Some(status.as_u16()),
         stream: is_sse,
@@ -361,6 +369,7 @@ async fn handle_request(
         client,
         client_source,
         peer,
+        request_model,
     };
 
     let observer_kind = if is_sse {
@@ -472,6 +481,26 @@ fn upstream_error_message(body: &[u8]) -> Option<String> {
     Some(truncate_to(message.to_string(), MAX_ERROR_MESSAGE_BYTES))
 }
 
+/// `body`, unchanged, with its root `model` written to `found` as it streams
+/// past. The scanner keeps only a capped key and model, never the body, and
+/// is dropped once the model is found.
+fn scan_for_model(
+    body: axum::body::BodyDataStream,
+    found: Arc<OnceLock<String>>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>> {
+    let mut scanner = Some(JsonUsageExtractor::model_only());
+    body.inspect(move |chunk| {
+        let (Some(s), Ok(bytes)) = (scanner.as_mut(), chunk) else {
+            return;
+        };
+        s.push(bytes);
+        if let Some(model) = s.model() {
+            let _ = found.set(model.to_string());
+            scanner = None;
+        }
+    })
+}
+
 fn new_call_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).unwrap_or(());
@@ -511,6 +540,12 @@ fn spawn_observer(
         };
 
         while let Some(msg) = rx.recv().await {
+            // The upload can still be streaming when the response begins.
+            // The request's model, once scanned, outranks a backfill from
+            // the response (invariant 6).
+            if base.model.is_none() {
+                base.model = base.request_model.get().cloned();
+            }
             match msg {
                 ObserveMsg::Chunk { bytes, elapsed_ms } => {
                     if dropped.load(Ordering::Relaxed) {
@@ -1705,6 +1740,12 @@ mod error_record_tests {
             buf.extend_from_slice(&chunk[..n]);
             if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                if head.contains("transfer-encoding: chunked") {
+                    if buf.ends_with(b"\r\n0\r\n\r\n") {
+                        return;
+                    }
+                    continue;
+                }
                 let len = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
@@ -1819,6 +1860,41 @@ mod error_record_tests {
             "x".repeat(MAX_ERROR_BODY_BYTES)
         );
         assert_eq!(stored_error_message("400 Bad Request", &body).await, None);
+    }
+
+    /// Over MAX_MODEL_INSPECT_BYTES, so streamed, with the model last.
+    fn large_request() -> String {
+        format!(
+            r#"{{"messages":[{{"role":"user","content":"{}"}}],"model":"m/large"}}"#,
+            "A".repeat(MAX_MODEL_INSPECT_BYTES)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_large_request_that_errors_keeps_its_model() {
+        // An error response carries no model to backfill from.
+        let body = r#"{"error":{"message":"Provider returned error"}}"#;
+        let upstream = raw_upstream(reply("400 Bad Request", body.len(), body)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let resp = chat(&proxy, large_request()).await;
+        assert_eq!(resp.status(), 400);
+        resp.bytes().await.unwrap();
+        let row = only_row(&store).await;
+        assert_eq!(row.model.as_deref(), Some("m/large"));
+    }
+
+    #[tokio::test]
+    async fn a_large_request_whose_upstream_hangs_up_keeps_its_model() {
+        // The upstream reads the whole body, then closes without answering.
+        let upstream = raw_upstream(Vec::new()).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        assert_eq!(chat(&proxy, large_request()).await.status(), 502);
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("other"));
+        assert_eq!(row.model.as_deref(), Some("m/large"));
     }
 
     #[tokio::test]
