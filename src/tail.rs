@@ -17,6 +17,7 @@ struct Row {
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
     error_kind: Option<String>,
+    error_message: Option<String>,
     stored_cost: Option<f64>,
     client: Option<String>,
     client_source: Option<String>,
@@ -58,7 +59,7 @@ pub fn run(n: usize, since: Option<String>, json: bool) -> Result<()> {
                 input_tokens, output_tokens,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 error_kind, cost, client, {exe_col} AS peer_exe,
-                {src_col} AS client_source, endpoint, anomaly
+                {src_col} AS client_source, endpoint, anomaly, error_message
          FROM calls
          WHERE ts >= ?1
          ORDER BY rowid DESC
@@ -85,6 +86,7 @@ pub fn run(n: usize, since: Option<String>, json: bool) -> Result<()> {
                 client_source: r.get(14)?,
                 endpoint: r.get(15)?,
                 anomaly: r.get(16)?,
+                error_message: r.get(17)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -140,6 +142,7 @@ fn print_json_line(r: &Row, prices: &PriceTable) {
         "cost_usd": cost,
         "cost_source": cost.map(|_| cost_source),
         "error_kind": r.error_kind,
+        "error_message": r.error_message,
         "anomaly": r.anomaly,
         "client": r.client,
         "client_source": r.client_source,
@@ -181,6 +184,13 @@ fn print_row(r: &Row, prices: &PriceTable) {
         (None, Some(s)) if s >= 400 => format!(" ERROR=http_{s}"),
         _ => String::new(),
     };
+    // Why it failed: a transport error's cause chain or the upstream's
+    // `error.message`, cut so the row stays one line.
+    let cause = r
+        .error_message
+        .as_deref()
+        .map(|m| format!(" {:?}", short_message(m)))
+        .unwrap_or_default();
     let anomaly = r
         .anomaly
         .as_deref()
@@ -196,9 +206,28 @@ fn print_row(r: &Row, prices: &PriceTable) {
     .map(|t| format!(" tool={}", short_tool(&display_tool(t))))
     .unwrap_or_default();
     println!(
-        "[{}] {} {} {} {}ms tokens={}{}{}{}{}{}",
-        r.ts, r.provider, model, status, r.latency_ms, tokens, cache, cost, err, anomaly, tool,
+        "[{}] {} {} {} {}ms tokens={}{}{}{}{}{}{}",
+        r.ts,
+        r.provider,
+        model,
+        status,
+        r.latency_ms,
+        tokens,
+        cache,
+        cost,
+        err,
+        cause,
+        anomaly,
+        tool,
     );
+}
+
+fn short_message(m: &str) -> String {
+    const MAX: usize = 160;
+    match m.char_indices().nth(MAX) {
+        Some((end, _)) => format!("{}…", &m[..end]),
+        None => m.to_string(),
+    }
 }
 
 /// First whitespace token of the tool label, bounded for one-line display.

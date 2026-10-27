@@ -44,6 +44,8 @@ const MAX_CLIENT_BYTES: usize = 128;
 /// Cap on the stored `error_message`: a transport error's cause chain or an
 /// upstream's `error.message`.
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
+/// An upstream error body larger than this is not read for `error.message`.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 /// Cap on verbatim usage sub-objects retained for the `raw_usage` audit
 /// column. Providers send one (OpenAI/Gemini) or two (Anthropic
 /// `message_start` + `message_delta`); the cap only guards against a
@@ -102,6 +104,8 @@ enum ObserverKind {
         parse: ParseJson,
         usage_key: &'static str,
         enabled: bool,
+        /// Keep a small error body for its `error.message`.
+        capture_error: bool,
     },
 }
 
@@ -368,6 +372,7 @@ async fn handle_request(
             parse: provider.parse_json,
             usage_key: provider.json_usage_key,
             enabled: status.is_success() && is_json_response(&resp_headers),
+            capture_error: keeps_error_message(status) && is_json_response(&resp_headers),
         }
     };
 
@@ -450,6 +455,23 @@ async fn handle_request(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Whether a response's `error.message` is worth keeping. Not on 401/403:
+/// providers echo part of the rejected key there ("Incorrect API key
+/// provided: sk-ab***cd").
+fn keeps_error_message(status: StatusCode) -> bool {
+    (status.is_client_error() || status.is_server_error())
+        && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+/// `error.message` from a JSON error body, the shape OpenAI, Anthropic,
+/// Gemini and OpenRouter share. Only that one string is kept: the rest of
+/// the body can carry account ids or echo the request.
+fn upstream_error_message(body: &[u8]) -> Option<String> {
+    let body: Value = serde_json::from_slice(body).ok()?;
+    let message = body.get("error")?.get("message")?.as_str()?;
+    Some(truncate_to(message.to_string(), MAX_ERROR_MESSAGE_BYTES))
+}
+
 fn new_call_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).unwrap_or(());
@@ -478,6 +500,14 @@ fn spawn_observer(
         let mut json_extractor = match &kind {
             ObserverKind::Json { usage_key, .. } => Some(JsonUsageExtractor::new(usage_key)),
             ObserverKind::Sse { .. } => None,
+        };
+        // The whole error body, until it outgrows MAX_ERROR_BODY_BYTES.
+        let mut error_body = match &kind {
+            ObserverKind::Json {
+                capture_error: true,
+                ..
+            } => Some(Vec::new()),
+            _ => None,
         };
 
         while let Some(msg) = rx.recv().await {
@@ -532,6 +562,13 @@ fn spawn_observer(
                                     extractor.push(&bytes);
                                 }
                             }
+                            if let Some(buf) = error_body.as_mut() {
+                                if buf.len() + bytes.len() > MAX_ERROR_BODY_BYTES {
+                                    error_body = None;
+                                } else {
+                                    buf.extend_from_slice(&bytes);
+                                }
+                            }
                         }
                     }
                 }
@@ -542,6 +579,10 @@ fn spawn_observer(
                     // object is worth keeping precisely because it went
                     // unparsed.
                     let degraded = anomaly.is_some();
+                    let error_message = match error_body.take() {
+                        Some(body) if !degraded => upstream_error_message(&body),
+                        _ => None,
+                    };
                     if anomaly.is_none() {
                         finalize_json_usage(
                             &kind,
@@ -567,7 +608,14 @@ fn spawn_observer(
                         spawn_record_write(
                             store,
                             record_from_base(
-                                &base, usage, elapsed_ms, ttft_ms, None, None, anomaly, raw_usage,
+                                &base,
+                                usage,
+                                elapsed_ms,
+                                ttft_ms,
+                                None,
+                                error_message,
+                                anomaly,
+                                raw_usage,
                             ),
                             base.peer,
                         );
@@ -1307,6 +1355,30 @@ mod tests {
     }
 
     #[test]
+    fn upstream_error_message_reads_only_a_string_error_message() {
+        let msg = |b: &str| upstream_error_message(b.as_bytes());
+        assert_eq!(
+            msg(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#)
+                .as_deref(),
+            Some("Overloaded")
+        );
+        assert_eq!(msg(r#"{"error":{"message":{"nested":1}}}"#), None);
+        assert_eq!(msg(r#"{"message":"top-level only"}"#), None);
+        assert_eq!(msg(r#"{"error":"#), None);
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(2000));
+        assert_eq!(msg(&long).unwrap().len(), MAX_ERROR_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn auth_failures_keep_no_error_message() {
+        assert!(keeps_error_message(StatusCode::NOT_FOUND));
+        assert!(keeps_error_message(StatusCode::BAD_GATEWAY));
+        assert!(!keeps_error_message(StatusCode::UNAUTHORIZED));
+        assert!(!keeps_error_message(StatusCode::FORBIDDEN));
+        assert!(!keeps_error_message(StatusCode::OK));
+    }
+
+    #[test]
     fn truncate_to_keeps_whole_chars() {
         assert_eq!(truncate_to("ab€".into(), 3), "ab");
         assert_eq!(truncate_to("ab€".into(), 5), "ab€");
@@ -1712,6 +1784,41 @@ mod error_record_tests {
             msg.contains("end of file before message length reached"),
             "{msg}"
         );
+    }
+
+    /// The error text of a call answered with `status` and `body`.
+    async fn stored_error_message(status: &str, body: &str) -> Option<String> {
+        let upstream = raw_upstream(reply(status, body.len(), body)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+        let resp = chat(&proxy, SMALL).await;
+        assert_eq!(resp.text().await.unwrap(), body, "forwarded unchanged");
+        let row = only_row(&store).await;
+        assert_eq!(row.error_kind, None);
+        row.error_message
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_keeps_only_its_message() {
+        let body = r#"{"error":{"message":"No endpoints found for google/gemini-2.0-flash-exp:free.","code":404},"user_id":"user_x"}"#;
+        assert_eq!(
+            stored_error_message("404 Not Found", body).await.as_deref(),
+            Some("No endpoints found for google/gemini-2.0-flash-exp:free.")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auth_error_message_is_not_kept() {
+        let body = r#"{"error":{"message":"Incorrect API key provided: sk-ab***cd"}}"#;
+        assert_eq!(stored_error_message("401 Unauthorized", body).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_large_error_body_is_not_read() {
+        let body = format!(
+            r#"{{"error":{{"message":"too big","detail":"{}"}}}}"#,
+            "x".repeat(MAX_ERROR_BODY_BYTES)
+        );
+        assert_eq!(stored_error_message("400 Bad Request", &body).await, None);
     }
 
     #[tokio::test]
