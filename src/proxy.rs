@@ -20,7 +20,7 @@ use reqwest::{Body as ReqwestBody, Client};
 use serde_json::Value;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -41,6 +41,11 @@ const MAX_MODEL_INSPECT_BYTES: usize = 256 * 1024;
 /// the request body itself — far past the old 64 KiB chat-delta ceiling.
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_CLIENT_BYTES: usize = 128;
+/// Cap on the stored `error_message`: a transport error's cause chain or an
+/// upstream's `error.message`.
+const MAX_ERROR_MESSAGE_BYTES: usize = 512;
+/// An upstream error body larger than this is not read for `error.message`.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 /// Cap on verbatim usage sub-objects retained for the `raw_usage` audit
 /// column. Providers send one (OpenAI/Gemini) or two (Anthropic
 /// `message_start` + `message_delta`); the cap only guards against a
@@ -71,6 +76,9 @@ struct RecordBase {
     /// Peer socket address, carried to the write task so the caller's process
     /// can be resolved off the forward path (invariant 2).
     peer: SocketAddr,
+    /// The root `model` of a request body too large to buffer, set once the
+    /// scan has read past it.
+    request_model: Arc<OnceLock<String>>,
 }
 
 enum ObserveMsg {
@@ -99,6 +107,8 @@ enum ObserverKind {
         parse: ParseJson,
         usage_key: &'static str,
         enabled: bool,
+        /// Keep a small error body for its `error.message`.
+        capture_error: bool,
     },
 }
 
@@ -232,6 +242,7 @@ async fn handle_request(
 
     let needs_body_read = should_inspect_body(&headers)
         && (model_from_path.is_none() || provider.inject_stream_options);
+    let request_model = Arc::new(OnceLock::new());
     let (model_from_body, upstream_body) = if needs_body_read {
         let body_bytes = axum::body::to_bytes(body, MAX_MODEL_INSPECT_BYTES)
             .await
@@ -247,6 +258,9 @@ async fn handle_request(
             body_bytes
         };
         (model, ReqwestBody::from(forwarded))
+    } else if model_from_path.is_none() {
+        let body = scan_for_model(body.into_data_stream(), request_model.clone());
+        (None, ReqwestBody::wrap_stream(body))
     } else {
         (None, ReqwestBody::wrap_stream(body.into_data_stream()))
     };
@@ -291,13 +305,14 @@ async fn handle_request(
         Ok(r) => r,
         Err(e) => {
             let message = sanitized_reqwest_error(&e);
-            let kind = classify_error(&message);
+            let kind = classify_reqwest_error(&e, &message);
             if is_inference_endpoint(&endpoint) {
                 let rec = Record {
                     id: call_id,
                     ts,
                     provider: provider.name.to_string(),
-                    model,
+                    // Known only if the failure came after the body's model.
+                    model: model.or_else(|| request_model.get().cloned()),
                     status: None,
                     latency_ms: t0.elapsed().as_millis() as u64,
                     ttft_ms: None,
@@ -346,7 +361,7 @@ async fn handle_request(
         id: call_id,
         ts,
         provider: provider.name.to_string(),
-        model,
+        model: model.or_else(|| request_model.get().cloned()),
         endpoint,
         status: Some(status.as_u16()),
         stream: is_sse,
@@ -354,6 +369,7 @@ async fn handle_request(
         client,
         client_source,
         peer,
+        request_model,
     };
 
     let observer_kind = if is_sse {
@@ -365,6 +381,7 @@ async fn handle_request(
             parse: provider.parse_json,
             usage_key: provider.json_usage_key,
             enabled: status.is_success() && is_json_response(&resp_headers),
+            capture_error: keeps_error_message(status) && is_json_response(&resp_headers),
         }
     };
 
@@ -387,7 +404,7 @@ async fn handle_request(
                 Ok(c) => c,
                 Err(e) => {
                     let message = sanitized_reqwest_error(&e);
-                    let kind = classify_error(&message).to_string();
+                    let kind = classify_reqwest_error(&e, &message).to_string();
                     let _ = body_tx
                         .send(Err(std::io::Error::other(message.clone())))
                         .await;
@@ -447,6 +464,43 @@ async fn handle_request(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// Whether a response's `error.message` is worth keeping. Not on 401/403:
+/// providers echo part of the rejected key there ("Incorrect API key
+/// provided: sk-ab***cd").
+fn keeps_error_message(status: StatusCode) -> bool {
+    (status.is_client_error() || status.is_server_error())
+        && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+/// `error.message` from a JSON error body, the shape OpenAI, Anthropic,
+/// Gemini and OpenRouter share. Only that one string is kept: the rest of
+/// the body can carry account ids or echo the request.
+fn upstream_error_message(body: &[u8]) -> Option<String> {
+    let body: Value = serde_json::from_slice(body).ok()?;
+    let message = body.get("error")?.get("message")?.as_str()?;
+    Some(truncate_to(message.to_string(), MAX_ERROR_MESSAGE_BYTES))
+}
+
+/// `body`, unchanged, with its root `model` written to `found` as it streams
+/// past. The scanner keeps only a capped key and model, never the body, and
+/// is dropped once the model is found.
+fn scan_for_model(
+    body: axum::body::BodyDataStream,
+    found: Arc<OnceLock<String>>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>> {
+    let mut scanner = Some(JsonUsageExtractor::model_only());
+    body.inspect(move |chunk| {
+        let (Some(s), Ok(bytes)) = (scanner.as_mut(), chunk) else {
+            return;
+        };
+        s.push(bytes);
+        if let Some(model) = s.model() {
+            let _ = found.set(model.to_string());
+            scanner = None;
+        }
+    })
+}
+
 fn new_call_id() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).unwrap_or(());
@@ -476,8 +530,22 @@ fn spawn_observer(
             ObserverKind::Json { usage_key, .. } => Some(JsonUsageExtractor::new(usage_key)),
             ObserverKind::Sse { .. } => None,
         };
+        // The whole error body, until it outgrows MAX_ERROR_BODY_BYTES.
+        let mut error_body = match &kind {
+            ObserverKind::Json {
+                capture_error: true,
+                ..
+            } => Some(Vec::new()),
+            _ => None,
+        };
 
         while let Some(msg) = rx.recv().await {
+            // The upload can still be streaming when the response begins.
+            // The request's model, once scanned, outranks a backfill from
+            // the response (invariant 6).
+            if base.model.is_none() {
+                base.model = base.request_model.get().cloned();
+            }
             match msg {
                 ObserveMsg::Chunk { bytes, elapsed_ms } => {
                     if dropped.load(Ordering::Relaxed) {
@@ -529,6 +597,13 @@ fn spawn_observer(
                                     extractor.push(&bytes);
                                 }
                             }
+                            if let Some(buf) = error_body.as_mut() {
+                                if buf.len() + bytes.len() > MAX_ERROR_BODY_BYTES {
+                                    error_body = None;
+                                } else {
+                                    buf.extend_from_slice(&bytes);
+                                }
+                            }
                         }
                     }
                 }
@@ -539,6 +614,10 @@ fn spawn_observer(
                     // object is worth keeping precisely because it went
                     // unparsed.
                     let degraded = anomaly.is_some();
+                    let error_message = match error_body.take() {
+                        Some(body) if !degraded => upstream_error_message(&body),
+                        _ => None,
+                    };
                     if anomaly.is_none() {
                         finalize_json_usage(
                             &kind,
@@ -564,7 +643,14 @@ fn spawn_observer(
                         spawn_record_write(
                             store,
                             record_from_base(
-                                &base, usage, elapsed_ms, ttft_ms, None, None, anomaly, raw_usage,
+                                &base,
+                                usage,
+                                elapsed_ms,
+                                ttft_ms,
+                                None,
+                                error_message,
+                                anomaly,
+                                raw_usage,
                             ),
                             base.peer,
                         );
@@ -938,7 +1024,73 @@ fn is_hop_by_hop_header(name: &HeaderName, connection_tokens: &[String]) -> bool
 }
 
 fn sanitized_reqwest_error(err: &reqwest::Error) -> String {
-    sanitize_error_message(&err.to_string(), err.url())
+    let message = sanitize_error_message(&error_chain(err), err.url());
+    truncate_to(message, MAX_ERROR_MESSAGE_BYTES)
+}
+
+/// `error_kind` for a reqwest failure, from reqwest's own flags rather than
+/// the text: with the cause chain appended, substrings mislead ("connection
+/// reset" from the upstream is not a client disconnect; "connection" contains
+/// "connect"). Text matching is kept only to split TLS from other connect
+/// failures.
+fn classify_reqwest_error(err: &reqwest::Error, message: &str) -> &'static str {
+    if err.is_timeout() {
+        return "upstream_timeout";
+    }
+    if err.is_connect() {
+        return match classify_error(message) {
+            kind @ ("upstream_tls" | "upstream_timeout") => kind,
+            _ => "upstream_connect",
+        };
+    }
+    if from_client_body(err) {
+        return "client_disconnect";
+    }
+    "other"
+}
+
+/// The forwarded request body is the client's own stream, so an `axum::Error`
+/// in the chain means the client's upload stopped, not the upstream.
+fn from_client_body(err: &reqwest::Error) -> bool {
+    let mut next = std::error::Error::source(err);
+    while let Some(e) = next {
+        if e.is::<axum::Error>() {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+/// `err` and every `source()` beneath it, joined with ": ". reqwest's own
+/// text is only "error sending request for url (..)"; whether that was a
+/// refused connect, a TLS failure, a reset, or a body that stopped mid-stream
+/// is in the chain. A link whose text an outer link already printed is
+/// skipped.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut next = err.source();
+    while let Some(e) = next {
+        let text = e.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        next = e.source();
+    }
+    out
+}
+
+/// Cut `s` to at most `max` bytes without splitting a char.
+fn truncate_to(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 fn sanitize_error_message(message: &str, url: Option<&reqwest::Url>) -> String {
@@ -1199,6 +1351,73 @@ mod tests {
             sanitized,
             "error sending request for url (https://api.example.com/v1/messages)"
         );
+    }
+
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl std::fmt::Display for Link {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_appends_sources_and_skips_repeats() {
+        // reqwest -> hyper-util -> its Connect kind -> the io error.
+        let link = |text, source| Some(Box::new(Link(text, source)));
+        let err = Link(
+            "error sending request for url (http://127.0.0.1:9/v1)",
+            link(
+                "client error (Connect)",
+                link(
+                    "Connect",
+                    link("tcp connect error: Connection refused", None),
+                ),
+            ),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (http://127.0.0.1:9/v1): \
+             client error (Connect): tcp connect error: Connection refused"
+        );
+    }
+
+    #[test]
+    fn upstream_error_message_reads_only_a_string_error_message() {
+        let msg = |b: &str| upstream_error_message(b.as_bytes());
+        assert_eq!(
+            msg(r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#)
+                .as_deref(),
+            Some("Overloaded")
+        );
+        assert_eq!(msg(r#"{"error":{"message":{"nested":1}}}"#), None);
+        assert_eq!(msg(r#"{"message":"top-level only"}"#), None);
+        assert_eq!(msg(r#"{"error":"#), None);
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(2000));
+        assert_eq!(msg(&long).unwrap().len(), MAX_ERROR_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn auth_failures_keep_no_error_message() {
+        assert!(keeps_error_message(StatusCode::NOT_FOUND));
+        assert!(keeps_error_message(StatusCode::BAD_GATEWAY));
+        assert!(!keeps_error_message(StatusCode::UNAUTHORIZED));
+        assert!(!keeps_error_message(StatusCode::FORBIDDEN));
+        assert!(!keeps_error_message(StatusCode::OK));
+    }
+
+    #[test]
+    fn truncate_to_keeps_whole_chars() {
+        assert_eq!(truncate_to("ab€".into(), 3), "ab");
+        assert_eq!(truncate_to("ab€".into(), 5), "ab€");
+        assert_eq!(truncate_to("abc".into(), 512), "abc");
     }
 
     #[test]
@@ -1463,5 +1682,248 @@ mod custody_tests {
             resp.bytes().await.unwrap();
             assert_eq!(*up.seen.lock().unwrap(), ["Bearer sk-client-own"]);
         }
+    }
+}
+
+/// What a failed call leaves in `calls`, through the real handler against
+/// raw-TCP upstreams that misbehave on purpose.
+#[cfg(test)]
+mod error_record_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// (proxy base URL, its store) for the openrouter port aimed at `upstream`.
+    async fn proxy_to(upstream: String) -> (String, Arc<Mutex<Store>>) {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let state = ProxyState {
+            provider: PROVIDERS.iter().find(|p| p.name == "openrouter").unwrap(),
+            client: Client::new(),
+            store: store.clone(),
+            custody: Arc::new(Custody::with_map(None)),
+            upstream_override: Some(upstream),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{addr}"), store)
+    }
+
+    /// An HTTP/1.1 upstream that reads one request, writes `reply` verbatim,
+    /// and closes.
+    async fn raw_upstream(reply: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            read_request(&mut s).await;
+            s.write_all(&reply).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn read_request(s: &mut TcpStream) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = s.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                if head.contains("transfer-encoding: chunked") {
+                    if buf.ends_with(b"\r\n0\r\n\r\n") {
+                        return;
+                    }
+                    continue;
+                }
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                if buf.len() >= end + 4 + len {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn reply(status: &str, content_length: usize, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+             content-length: {content_length}\r\nconnection: close\r\n\r\n{body}"
+        )
+        .into_bytes()
+    }
+
+    async fn chat(proxy: &str, body: impl Into<reqwest::Body>) -> reqwest::Response {
+        Client::new()
+            .post(format!("{proxy}/api/v1/chat/completions?key=sk-secret"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The one row the call left. Rows are written off the request path, so
+    /// wait for it.
+    async fn only_row(store: &Mutex<Store>) -> Record {
+        for _ in 0..300 {
+            let mut rows = store.lock().unwrap().all();
+            if !rows.is_empty() {
+                assert_eq!(rows.len(), 1);
+                return rows.remove(0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no row written");
+    }
+
+    const SMALL: &str = r#"{"model":"m/x","messages":[]}"#;
+
+    #[tokio::test]
+    async fn a_refused_connect_keeps_its_cause() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (proxy, store) = proxy_to(upstream).await;
+
+        assert_eq!(chat(&proxy, SMALL).await.status(), 502);
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("upstream_connect"));
+        let msg = row.error_message.unwrap();
+        assert!(msg.contains("Connection refused"), "{msg}");
+        assert!(!msg.contains("sk-secret"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_is_other_not_connect() {
+        // "connection" contains "connect": text matching called this a
+        // connect failure.
+        let upstream = raw_upstream(reply("200 OK", 1000, r#"{"id""#)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let resp = chat(&proxy, SMALL).await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.is_err());
+        let row = only_row(&store).await;
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.error_kind.as_deref(), Some("other"));
+        let msg = row.error_message.unwrap();
+        assert!(
+            msg.contains("end of file before message length reached"),
+            "{msg}"
+        );
+    }
+
+    /// The error text of a call answered with `status` and `body`.
+    async fn stored_error_message(status: &str, body: &str) -> Option<String> {
+        let upstream = raw_upstream(reply(status, body.len(), body)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+        let resp = chat(&proxy, SMALL).await;
+        assert_eq!(resp.text().await.unwrap(), body, "forwarded unchanged");
+        let row = only_row(&store).await;
+        assert_eq!(row.error_kind, None);
+        row.error_message
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_keeps_only_its_message() {
+        let body = r#"{"error":{"message":"No endpoints found for google/gemini-2.0-flash-exp:free.","code":404},"user_id":"user_x"}"#;
+        assert_eq!(
+            stored_error_message("404 Not Found", body).await.as_deref(),
+            Some("No endpoints found for google/gemini-2.0-flash-exp:free.")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auth_error_message_is_not_kept() {
+        let body = r#"{"error":{"message":"Incorrect API key provided: sk-ab***cd"}}"#;
+        assert_eq!(stored_error_message("401 Unauthorized", body).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_large_error_body_is_not_read() {
+        let body = format!(
+            r#"{{"error":{{"message":"too big","detail":"{}"}}}}"#,
+            "x".repeat(MAX_ERROR_BODY_BYTES)
+        );
+        assert_eq!(stored_error_message("400 Bad Request", &body).await, None);
+    }
+
+    /// Over MAX_MODEL_INSPECT_BYTES, so streamed, with the model last.
+    fn large_request() -> String {
+        format!(
+            r#"{{"messages":[{{"role":"user","content":"{}"}}],"model":"m/large"}}"#,
+            "A".repeat(MAX_MODEL_INSPECT_BYTES)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_large_request_that_errors_keeps_its_model() {
+        // An error response carries no model to backfill from.
+        let body = r#"{"error":{"message":"Provider returned error"}}"#;
+        let upstream = raw_upstream(reply("400 Bad Request", body.len(), body)).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let resp = chat(&proxy, large_request()).await;
+        assert_eq!(resp.status(), 400);
+        resp.bytes().await.unwrap();
+        let row = only_row(&store).await;
+        assert_eq!(row.model.as_deref(), Some("m/large"));
+    }
+
+    #[tokio::test]
+    async fn a_large_request_whose_upstream_hangs_up_keeps_its_model() {
+        // The upstream reads the whole body, then closes without answering.
+        let upstream = raw_upstream(Vec::new()).await;
+        let (proxy, store) = proxy_to(upstream).await;
+
+        assert_eq!(chat(&proxy, large_request()).await.status(), 502);
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("other"));
+        assert_eq!(row.model.as_deref(), Some("m/large"));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_mid_upload_is_client_disconnect() {
+        // The upstream reads and never answers; the client sends 64 KiB of a
+        // declared 2 MiB (the streamed path) and hangs up.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 65536];
+            while s.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+        let (proxy, store) = proxy_to(upstream).await;
+
+        let mut client = TcpStream::connect(proxy.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /api/v1/chat/completions HTTP/1.1\r\nhost: x\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            2 * 1024 * 1024
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.write_all(&[b' '; 65536]).await.unwrap();
+        drop(client);
+
+        let row = only_row(&store).await;
+        assert_eq!(row.status, None);
+        assert_eq!(row.error_kind.as_deref(), Some("client_disconnect"));
     }
 }
